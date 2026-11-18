@@ -187,7 +187,7 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
-        #region TryAddA(Name, Address, TTL, out Record, out Note, out Error)
+        #region TryAddA(Name, Address, TTL, out Record, out Note, out Error, out NotSaved)
 
         /// <summary>
         /// One A record more: the given name answers with the given IPv4 address.
@@ -204,16 +204,19 @@ namespace cloud.charging.open.DNSServer
         /// <param name="Record">The record added.</param>
         /// <param name="Note">What else changed, if anything.</param>
         /// <param name="Error">Why nothing was added.</param>
+        /// <param name="NotSaved">Whether nothing was added because the records could not be written: not the caller's fault.</param>
         public Boolean TryAddA(String                            Name,
                                IPv4Address                       Address,
                                TimeSpan                          TTL,
                                [NotNullWhen(true)]  out A?       Record,
                                out String?                       Note,
-                               [NotNullWhen(false)] out String?  Error)
+                               [NotNullWhen(false)] out String?  Error,
+                               out Boolean                       NotSaved)
         {
 
-            Record  = null;
-            Note    = null;
+            Record    = null;
+            Note      = null;
+            NotSaved  = false;
 
             if (!TryParseName(Name, out var domainName, out Error))
                 return false;
@@ -243,7 +246,10 @@ namespace cloud.charging.open.DNSServer
                                         ToList();
 
                 if (!TryPersist(updated, out Error))
+                {
+                    NotSaved = true;
                     return false;
+                }
 
                 Apply(updated, record.DomainName, DNSResourceRecordTypes.A);
 
@@ -271,7 +277,7 @@ namespace cloud.charging.open.DNSServer
         /// <param name="Type">The type of the records.</param>
         /// <param name="Matches">Which of them to take away, or null for all.</param>
         /// <param name="Removed">What was taken away: nothing, where nothing matched.</param>
-        /// <param name="Error">Why nothing was taken away, though something matched.</param>
+        /// <param name="Error">Why nothing was taken away, though something matched: the records could not be written.</param>
         public Boolean TryRemove(String                                                 Name,
                                  DNSResourceRecordTypes                                 Type,
                                  Func<IDNSResourceRecord, Boolean>?                     Matches,

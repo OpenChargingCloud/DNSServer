@@ -17,8 +17,6 @@
 
 #region Usings
 
-using System.Globalization;
-
 using org.GraphDefined.Vanaheimr.CLI;
 using org.GraphDefined.Vanaheimr.Illias;
 using org.GraphDefined.Vanaheimr.Hermod;
@@ -153,25 +151,14 @@ namespace cloud.charging.open.DNSServer.CommandLine
             if (!cli.MayDo(Permission.Edit(DNSServerAccess.NameServer), CommandName, out var refused))
                 return [ refused ];
 
-            if (!IPv4Address.TryParse(Arguments[3], out var address))
-                return [ $"'{Arguments[3]}' is no IPv4 address." ];
+            var change = cli.DNSServer.AddA(Arguments[2],
+                                            Arguments[3],
+                                            Arguments.Length == 5 ? Arguments[4] : null,
+                                            cli.Caller.ToString());
 
-            var node = cli.DNSServer;
-            var ttl  = node.Settings.DefaultTTL;
-
-            if (Arguments.Length == 5 && !TryParseTTL(Arguments[4], out ttl))
-                return [ $"'{Arguments[4]}' is no TTL: a number of seconds, or one with s, m, h or d after it." ];
-
-            if (!node.Records.TryAddA(Arguments[2], address, ttl, out var record, out var note, out var error))
-                return [ error ];
-
-            var said = $"{record.DomainName.FullName} answers with {address} from now on, TTL {(Int64) ttl.TotalSeconds} s.";
-
-            node.Log.Notice($"{said} ({cli.Caller})", "dnsserver", "records");
-
-            return note is not null
-                       ? [ said, note ]
-                       : [ said ];
+            return change.Note is not null
+                       ? [ change.Said, change.Note ]
+                       : [ change.Said ];
 
         }
 
@@ -188,40 +175,9 @@ namespace cloud.charging.open.DNSServer.CommandLine
             if (!cli.MayDo(Permission.Edit(DNSServerAccess.NameServer), CommandName, out var refused))
                 return [ refused ];
 
-            IPv4Address? address = null;
-
-            if (Arguments.Length == 4)
-            {
-
-                if (!IPv4Address.TryParse(Arguments[3], out var parsed))
-                    return [ $"'{Arguments[3]}' is no IPv4 address." ];
-
-                address = parsed;
-
-            }
-
-            var node = cli.DNSServer;
-
-            if (!node.Records.TryRemove(Arguments[2],
-                                        DNSResourceRecordTypes.A,
-                                        address.HasValue
-                                            ? record => record is A a && a.IPv4Address == address.Value
-                                            : null,
-                                        out var removed,
-                                        out var error))
-                return [ error ];
-
-            if (removed.Count == 0)
-                return [ address.HasValue
-                             ? $"{Arguments[2]} does not answer with {address.Value}: nothing was removed."
-                             : $"{Arguments[2]} has no A record: nothing was removed." ];
-
-            var name = removed[0].DomainName.FullName;
-            var said = $"{name} no longer answers with {String.Join(", ", removed.OfType<A>().Select(a => a.IPv4Address))}.";
-
-            node.Log.Notice($"{said} ({cli.Caller})", "dnsserver", "records");
-
-            return [ said ];
+            return [ cli.DNSServer.RemoveA(Arguments[2],
+                                           Arguments.Length == 4 ? Arguments[3] : null,
+                                           cli.Caller.ToString()).Said ];
 
         }
 
@@ -241,51 +197,6 @@ namespace cloud.charging.open.DNSServer.CommandLine
         private static Boolean Is(String Text, String[] Words)
 
             => Words.Any(word => word.Equals(Text, StringComparison.OrdinalIgnoreCase));
-
-        #endregion
-
-        #region (internal static) TryParseTTL(Text, out TTL)
-
-        /// <summary>
-        /// A number of seconds, or one with s, m, h or d after it: "3600", "60m", "1h", "1d".
-        /// </summary>
-        internal static Boolean TryParseTTL(String Text, out TimeSpan TTL)
-        {
-
-            TTL = TimeSpan.Zero;
-
-            var text = Text.Trim().ToLowerInvariant();
-
-            if (text.Length == 0)
-                return false;
-
-            var factor = text[^1] switch {
-                             's' => 1L,
-                             'm' => 60L,
-                             'h' => 3600L,
-                             'd' => 86400L,
-                             _   => 0L
-                         };
-
-            if (factor > 0)
-                text = text[..^1];
-            else
-                factor = 1;
-
-            if (!Int64.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var number) ||
-                number > Int32.MaxValue)
-                return false;
-
-            var seconds = number * factor;
-
-            // RFC 2181 §8: a TTL is an unsigned 31-bit number.
-            if (seconds is < 0 or > Int32.MaxValue)
-                return false;
-
-            TTL = TimeSpan.FromSeconds(seconds);
-            return true;
-
-        }
 
         #endregion
 

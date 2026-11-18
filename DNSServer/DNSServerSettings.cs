@@ -17,6 +17,7 @@
 
 #region Usings
 
+using System.Globalization;
 using System.Diagnostics.CodeAnalysis;
 
 using Newtonsoft.Json.Linq;
@@ -261,6 +262,52 @@ namespace cloud.charging.open.DNSServer
             }
 
             return org.GraphDefined.Vanaheimr.Hermod.IPAddress.TryParse(text, out Address);
+
+        }
+
+        #endregion
+
+        #region (static) TryParseTTL(Text, out TTL)
+
+        /// <summary>
+        /// A TTL as somebody types it: a number of seconds, or one with s, m, h
+        /// or d after it - "3600", "60m", "1h", "1d".
+        /// </summary>
+        public static Boolean TryParseTTL(String Text, out TimeSpan TTL)
+        {
+
+            TTL = TimeSpan.Zero;
+
+            var text = Text.Trim().ToLowerInvariant();
+
+            if (text.Length == 0)
+                return false;
+
+            var factor = text[^1] switch {
+                             's' => 1L,
+                             'm' => 60L,
+                             'h' => 3600L,
+                             'd' => 86400L,
+                             _   => 0L
+                         };
+
+            if (factor > 0)
+                text = text[..^1];
+            else
+                factor = 1;
+
+            if (!Int64.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var number) ||
+                number > Int32.MaxValue)
+                return false;
+
+            var seconds = number * factor;
+
+            // RFC 2181 §8: a TTL is an unsigned 31-bit number.
+            if (seconds is < 0 or > Int32.MaxValue)
+                return false;
+
+            TTL = TimeSpan.FromSeconds(seconds);
+            return true;
 
         }
 

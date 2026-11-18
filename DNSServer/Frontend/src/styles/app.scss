@@ -1,0 +1,57 @@
+// The web interface of a DNS server. What every node shows alike - the frame,
+// the forms, sign-in, logs, DNS, NTS, pins, the certificate store, a commit on
+// the Configuration page - is WWCP_Node's, in the DNS server's colour - the
+// teal of a globe; what follows is what only its own pages need.
+@use '@node/styles/node' as * with (
+    $color-accent:       #1f6f78,
+    $color-accent-dark:  #17545b
+);
+
+
+// Whether it answers: a chip and a line beside it.
+.dns-state {
+
+    display:      flex;
+    flex-wrap:    wrap;
+    gap:          0.5rem;
+    align-items:  baseline;
+    margin:       0 0 0.75rem;
+
+}
+
+// The records: a name and its data are compared character by character, and
+// copied - never cut, broken anywhere rather than widening the table.
+table.records.dns-records {
+
+    td.record-name,
+    td.record-data {
+        font-family:    $font-mono;
+        overflow-wrap:  anywhere;
+        white-space:    normal;
+    }
+
+    td.record-type,
+    td.record-ttl {
+        white-space: nowrap;
+    }
+
+    td.record-actions {
+        white-space:  nowrap;
+        text-align:   right;
+    }
+
+}
+
+// The line a resolver is asked with, to be copied as one.
+pre.ask-with {
+
+    font-family:    $font-mono;
+    font-size:      0.8rem;
+    background:     $color-bg;
+    border:         1px solid $color-border;
+    border-radius:  $radius;
+    padding:        0.6rem;
+    overflow-x:     auto;
+    margin:         0.75rem 0 0;
+
+}

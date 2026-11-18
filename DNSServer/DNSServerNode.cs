@@ -48,8 +48,9 @@ namespace cloud.charging.open.DNSServer
 
     /// <summary>
     /// One name server for a local network: a WWCP node that answers DNS over
-    /// UDP and TCP with the records it was given - at its command line, over
-    /// SSH, or in the "dnsServer" section of its configuration file.
+    /// UDP and TCP with the records it was given - in its web interface, at its
+    /// command line, over SSH, or in the "dnsServer" section of its
+    /// configuration file.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -64,7 +65,7 @@ namespace cloud.charging.open.DNSServer
     /// with its command line, and the log - is the node below.
     /// </para>
     /// </remarks>
-    public class DNSServerNode : WWCPNode
+    public partial class DNSServerNode : WWCPNode
     {
 
         #region Data
@@ -112,6 +113,12 @@ namespace cloud.charging.open.DNSServer
         /// </summary>
         public static readonly      NodePort  DNSTCPPort        = new ("DNS over TCP");
 
+        /// <summary>
+        /// The manifest resource prefix of the embedded web interface (see the
+        /// EmbedFrontend target of DNSServer.csproj).
+        /// </summary>
+        public const                String    HTTPRoot          = "cloud.charging.open.DNSServer.HTTPRoot.";
+
         private Int64 requestsReceived;
         private Int64 responsesSent;
 
@@ -128,6 +135,11 @@ namespace cloud.charging.open.DNSServer
         /// The records answered with.
         /// </summary>
         public ResourceRecords    Records      { get; }
+
+        /// <summary>
+        /// The JSON API.
+        /// </summary>
+        public DNSServerHTTPAPI   API          { get; }
 
         /// <summary>
         /// Hermod's DNS server, which answers.
@@ -169,7 +181,7 @@ namespace cloud.charging.open.DNSServer
         #region Constructor(s)
 
         /// <summary>
-        /// One DNS server, with its command line over SSH.
+        /// One DNS server, with its web interface and its command line over SSH.
         /// </summary>
         /// <param name="HTTPHostname">The address the web interface listens on; 127.0.0.1 by default.</param>
         /// <param name="HTTPPort">The TCP port it listens on; <see cref="DefaultHTTPPort"/> by default.</param>
@@ -181,7 +193,7 @@ namespace cloud.charging.open.DNSServer
         /// <param name="ConfigFile">Where the configuration - and with it the records - lives between starts.</param>
         /// <param name="DNSClient">How this node resolves names itself, or null to make a client.</param>
         /// <param name="NTSClient">Where the node reads the time for its own check, or null to make a client.</param>
-        /// <param name="Frontend">Where the web interface comes from, or null for none.</param>
+        /// <param name="Frontend">Where the web interface comes from, or null for the embedded bundle.</param>
         /// <param name="CertificatesPath">The directory the node's certificate store lives in between starts.</param>
         /// <param name="Log">Where everything that happens is written, or null to make a log.</param>
         /// <param name="LogToConsole">Whether the log is also written to the console.</param>
@@ -226,7 +238,7 @@ namespace cloud.charging.open.DNSServer
                    ConfigFile:            ConfigFile,
                    DNSClient:             DNSClient,
                    NTSClient:             NTSClient,
-                   Frontend:              Frontend,
+                   Frontend:              Frontend ?? new EmbeddedContentSource(HTTPRoot, typeof(DNSServerNode).Assembly),
                    CertificatesPath:      CertificatesPath,
                    CertificateKinds:      CertificateKinds,
                    Log:                   Log,
@@ -285,6 +297,19 @@ namespace cloud.charging.open.DNSServer
                 Interlocked.Increment(ref responsesSent);
                 return Task.CompletedTask;
             };
+
+            #endregion
+
+            #region The JSON API
+
+            this.API = new DNSServerHTTPAPI(
+                           HTTPServer:  this.HTTPServer,
+                           Node:        this,
+                           ExtAPI:      this.ExtAPI,
+                           Log:         this.Log,
+                           APIPath:     this.HTTPRootPath,
+                           Version:     Version
+                       );
 
             #endregion
 
@@ -422,6 +447,8 @@ namespace cloud.charging.open.DNSServer
         protected override Task OnStarted()
         {
 
+            Log.Info($"The JSON API of the name server is at {APIURL}v1/dnsServer", "web", "http");
+
             Log.Notice($"DNS is answered {ListenersText()}, with {Records.Count} record(s).", "dnsserver");
 
             return Task.CompletedTask;
@@ -480,6 +507,10 @@ namespace cloud.charging.open.DNSServer
                    new JProperty("udp",               UDPSocket?.ToString()),
                    new JProperty("tcp",               TCPSocket?.ToString()),
                    new JProperty("records",           Records.Count),
+                   new JProperty("recordTypes",       new JObject(Records.All.
+                                                                      GroupBy (record => ADNSResourceRecord.TypeName(record.Type)).
+                                                                      OrderBy (group  => group.Key, StringComparer.Ordinal).
+                                                                      Select  (group  => new JProperty(group.Key, group.Count())))),
                    new JProperty("requestsReceived",  RequestsReceived),
                    new JProperty("responsesSent",     ResponsesSent)
                );
