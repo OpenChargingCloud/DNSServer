@@ -22,6 +22,7 @@ using System.Security.Cryptography;
 
 using Newtonsoft.Json.Linq;
 
+using org.GraphDefined.Vanaheimr.Illias;
 using org.GraphDefined.Vanaheimr.Hermod;
 
 using cloud.charging.open.protocols.WWCP.Node;
@@ -68,7 +69,7 @@ namespace cloud.charging.open.DNSServer.Tests
             File.WriteAllText(file, Configuration.ToString());
 
             return new DNSServerNode(
-                       HTTPPort:          IPPort.Parse(TestPorts.Free()),
+                       HTTPPort:          TestPorts.Free(),
                        AccountsPath:      Path.Combine(Directory, "accounts"),
                        ConfigFile:        new WWCPConfigFile(file),
                        CertificatesPath:  Path.Combine(Directory, "certificates"),
@@ -147,7 +148,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             var password            = "An-Operator-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(12));
 
-            await AccountIn("operator1", DNSServerAccess.Operator.Name, password);
+            await AccountIn(User_Id.Parse("operator1"), DNSServerAccess.Operator.Name, password);
 
             using var http          = await SignedInAs("operator1", password);
 
@@ -174,7 +175,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             var password            = "A-Hostmaster-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(12));
 
-            await AccountIn("hostmaster1", DNSServerAccess.Hostmaster.Name, password);
+            await AccountIn(User_Id.Parse("hostmaster1"), DNSServerAccess.Hostmaster.Name, password);
 
             using var http          = await SignedInAs("hostmaster1", password);
 

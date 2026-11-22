@@ -203,7 +203,7 @@ namespace cloud.charging.open.DNSServer
         /// <param name="SSH">What the program says about the SSH server.</param>
         /// <param name="Web">What the program says of HTTPS and of the reverse proxies in front.</param>
         /// <param name="CommandLine">What the switches of this start say over the "dnsServer" section, or null for nothing.</param>
-        public DNSServerNode(IIPAddress?                                    HTTPHostname       = null,
+        public DNSServerNode(org.GraphDefined.Vanaheimr.Hermod.IPAddress? HTTPHostname       = null,
                              IPPort?                                        HTTPPort           = null,
                              HTTPServer?                                    HTTPServer         = null,
                              HTTPPath?                                      BasePath           = null,

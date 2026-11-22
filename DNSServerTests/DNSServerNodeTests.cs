@@ -122,7 +122,7 @@ namespace cloud.charging.open.DNSServer.Tests
             }
 
             var node = new DNSServerNode(
-                           HTTPPort:          IPPort.Parse(TestPorts.Free()),
+                           HTTPPort:          TestPorts.Free(),
                            AccountsPath:      Path.Combine(Directory, "accounts"),
                            ConfigFile:        new WWCPConfigFile(file),
                            CertificatesPath:  Path.Combine(Directory, "certificates"),
@@ -470,7 +470,7 @@ namespace cloud.charging.open.DNSServer.Tests
                               ))).ToString());
 
             var problem = Assert.Throws<InvalidOperationException>(() => new DNSServerNode(
-                              HTTPPort:          IPPort.Parse(TestPorts.Free()),
+                              HTTPPort:          TestPorts.Free(),
                               AccountsPath:      Path.Combine(directory, "accounts"),
                               ConfigFile:        new WWCPConfigFile(ConfigFileIn(directory)),
                               CertificatesPath:  Path.Combine(directory, "certificates"),

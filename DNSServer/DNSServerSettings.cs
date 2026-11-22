@@ -77,7 +77,7 @@ namespace cloud.charging.open.DNSServer
         /// <summary>
         /// The address DNS listens on: every address of both families by default.
         /// </summary>
-        public IIPAddress             Listen        { get; init; } = IPvXAddress.Any;
+        public IPAddress             Listen        { get; init; } = IPvXAddress.Any;
 
         /// <summary>
         /// The port DNS listens on, UDP and TCP.
@@ -248,10 +248,10 @@ namespace cloud.charging.open.DNSServer
         /// An IPv4 or IPv6 address, or "any" for every address of both families.
         /// </summary>
         public static Boolean TryParseListen(String?                              Text,
-                                             [NotNullWhen(true)] out IIPAddress?  Address)
+                                             out IPAddress                       Address)
         {
 
-            Address = null;
+            Address = default;
 
             var text = Text?.Trim() ?? "";
 
@@ -318,7 +318,7 @@ namespace cloud.charging.open.DNSServer
         /// <summary>
         /// The address as the section writes it: "any", or the address.
         /// </summary>
-        public static String TextOf(IIPAddress Address)
+        public static String TextOf(IPAddress Address)
 
             => Address is IPvXAddress
                    ? "any"
