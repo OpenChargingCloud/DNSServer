@@ -716,6 +716,31 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region ATextWithQuotes_IsTypedWithBackslashes()
+
+        [Test]
+        public async Task ATextWithQuotes_IsTypedWithBackslashes()
+        {
+
+            var node     = await Started(NewDirectory());
+
+            var added    = await AtTheConsole(node, "txtRecords add example.org \"say \\\"hello\\\" C:\\\\temp\"");
+
+            Assert.That(added[0], Does.Contain("answers with the text \"say \"hello\" C:\\temp\""));
+
+            var asked    = await AskFor(node, "example.org", 16);
+
+            Assert.That(asked.Answers.Select(answer => answer.Data), Is.EqualTo(new[] { "say \"hello\" C:\\temp" }));
+
+            var removed  = await AtTheConsole(node, "txtRecords remove example.org \"say \\\"hello\\\" C:\\\\temp\"");
+
+            Assert.That(removed[0],         Does.Contain("no longer answers with"));
+            Assert.That(node.Records.Count, Is.Zero);
+
+        }
+
+        #endregion
+
         #region (private) Restarted(Node, Directory)
 
         /// <summary>

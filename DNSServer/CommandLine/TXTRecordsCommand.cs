@@ -35,10 +35,11 @@ namespace cloud.charging.open.DNSServer.CommandLine
     /// txtRecords add &lt;name&gt; "&lt;text&gt;" [&lt;ttl&gt;]    the name answers with the text as well
     /// txtRecords remove &lt;name&gt; ["&lt;text&gt;"]        the name no longer answers with the text - with any, where none is given
     /// </code>
-    /// A text with spaces in it is put in double quotes, and is one record; a
-    /// text that holds a double quote itself is added over the JSON API or in
-    /// the web interface. A text longer than 255 octets is answered as several
-    /// character-strings, which a reader puts together again (RFC 7208 §3.3).
+    /// A text with spaces in it is put in double quotes, and is one record;
+    /// within them \" is a double quote and \\ a backslash, as in a zone file:
+    /// txtRecords add example.org "say \"hello\"". A text longer than 255
+    /// octets is answered as several character-strings, which a reader puts
+    /// together again (RFC 7208 §3.3).
     /// </remarks>
     /// <param name="CLI">The command line of the DNS server.</param>
     public class TXTRecordsCommand(DNSServerCLI CLI) : TypedRecordsCommand(CLI,
