@@ -70,6 +70,8 @@ export interface NameServerStatus {
     records:           number;
     /** How many of them of each type: { "A": 2 }. */
     recordTypes:       Record<string, number>;
+    /** The zones it is authoritative for: [ "example.org." ]. */
+    zones:             string[];
     requestsReceived:  number;
     responsesSent:     number;
 }
@@ -84,6 +86,8 @@ export interface NameServerSettings {
     defaultTTL:  number;
     /** The records, as zone-file lines. */
     records:     string[];
+    /** The zones it is authoritative for. */
+    zones:       Zone[];
 }
 
 /** One record the name server answers with. */
@@ -149,6 +153,49 @@ export interface RecordsChanged {
 }
 
 
+/**
+ * A zone the name server is authoritative for: a name and everything below
+ * it, with the SOA and NS records the server makes for it.
+ */
+export interface Zone {
+    /** Complete, with its trailing dot: "example.org.". */
+    name:         string;
+    /** What its NS records name; the first is the primary of its SOA. */
+    nameServers:  string[];
+    /** Who is responsible for it, as its SOA says: "hostmaster@example.org". */
+    hostmaster:   string;
+    /** YYYYMMDDnn, counted on by every change of a record in it. */
+    serial:       number;
+    /** The timers of its SOA, in seconds. */
+    refresh:      number;
+    retry:        number;
+    expire:       number;
+    /** The negative TTL: how long a resolver keeps a "not there". */
+    minimum:      number;
+}
+
+/** A zone as GET /dnsServer/zones lists it: with the SOA and NS records it makes, and what it lacks to be found. */
+export interface ListedZone extends Zone {
+    records:  ResourceRecord[];
+    /** Which of its name servers are in it and have no address yet - or null. */
+    note:     string | null;
+}
+
+/** A new zone: ADD /dnsServer/zones - { name, nameServers? }; without name servers, "ns." and the zone. */
+export interface NewZone {
+    name:          string;
+    nameServers?:  string[];
+}
+
+/** What a change of the zones answers: what it said, and the zones as they are now. */
+export interface ZonesChanged {
+    said:   string;
+    /** What the zone lacks to be found, if anything. */
+    note:   string | null;
+    zones:  ListedZone[];
+}
+
+
 /** How the DNS server is asked: the routes every node has, typed with the server's own of them, and the name server. */
 export const api = {
 
@@ -159,7 +206,10 @@ export const api = {
         settings:  ()                       => request<NameServerSettings> ('GET',  '/dnsServer/settings'),
         records:   ()                       => request<ResourceRecord[]>   ('GET',  '/dnsServer/records'),
         add:       (type: ChangeableType, record: NewRecord)      => request<RecordsChanged>  ('ADD',    `/dnsServer/records/${type.toLowerCase()}`, record),
-        remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('REMOVE', `/dnsServer/records/${type.toLowerCase()}`, record)
+        remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('REMOVE', `/dnsServer/records/${type.toLowerCase()}`, record),
+        zones:       ()                     => request<ListedZone[]>       ('GET',    '/dnsServer/zones'),
+        addZone:     (zone: NewZone)        => request<ZonesChanged>       ('ADD',    '/dnsServer/zones', zone),
+        removeZone:  (name: string)         => request<ZonesChanged>       ('REMOVE', '/dnsServer/zones', { name })
     }
 
 };

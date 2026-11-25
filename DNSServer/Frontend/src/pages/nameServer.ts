@@ -94,10 +94,15 @@ export const nameServerPage: Page = {
 
                     <div class="kv-list">
                         <div class="kv"><span class="k">Default TTL</span> <span class="v" id="default-ttl">${ttlWords(Settings.defaultTTL)}</span></div>
+                        <div class="kv"><span class="k">Zones</span>       <span class="v" id="zone-names">${Status.zones.length === 0
+                                                                                                         ? 'none: the records are answered by their name alone'
+                                                                                                         : Status.zones.join(', ')}</span></div>
                     </div>
 
                     <p class="hint">
-                        The records are listed, added and removed on the <a href="${toURL('/dnsServer/records')}">Records</a> page.
+                        The records are listed, added and removed on the <a href="${toURL('/dnsServer/records')}">Records</a> page,
+                        the zones - with the SOA and NS records the server makes for them - on the
+                        <a href="${toURL('/dnsServer/zones')}">Zones</a> page.
                     </p>
 
                 </section>

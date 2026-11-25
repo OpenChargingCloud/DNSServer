@@ -17,6 +17,7 @@
 
 #region Usings
 
+using System.Text.RegularExpressions;
 using System.Diagnostics.CodeAnalysis;
 
 using org.GraphDefined.Vanaheimr.Hermod;
@@ -28,16 +29,24 @@ namespace cloud.charging.open.DNSServer
 {
 
     /// <summary>
-    /// The resource records a name server answers with: the zone Hermod's DNS
-    /// server asks, and the list they are written back to the configuration
-    /// file from.
+    /// The resource records a name server answers with, and the zones it is
+    /// authoritative for: what Hermod's DNS server asks, and the lists they
+    /// are written back to the configuration file from.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The zone cannot say what it holds, and the file has to be written in the
-    /// order somebody added to it, so the records are kept twice: here as a
-    /// list, and in the zone for the lookups. Every change goes through here
-    /// and keeps the two the same.
+    /// Hermod's in-memory zone holds one zone - the one its SOA starts - so
+    /// every zone has one of its own here: with the SOA and NS records the
+    /// zone makes, and the records at its name and below. A question goes to
+    /// the zone its name is in, the one with the longest name where zones are
+    /// within each other. The records in no zone are answered as before there
+    /// were zones: by their name exactly.
+    /// </para>
+    /// <para>
+    /// The zones cannot say what they hold, and the file has to be written in
+    /// the order somebody added to it, so the records are kept twice: here as
+    /// a list, and in the zones for the lookups. Every change goes through here,
+    /// and makes the zones anew from the list.
     /// </para>
     /// <para>
     /// Written first, put into effect afterwards: a change the file cannot take
@@ -45,14 +54,25 @@ namespace cloud.charging.open.DNSServer
     /// the next start answers too.
     /// </para>
     /// </remarks>
-    public sealed class ResourceRecords
+    public sealed class ResourceRecords : IDNSZoneStore
     {
 
         #region Data
 
-        private readonly Lock                                          gate     = new();
-        private readonly List<IDNSResourceRecord>                      records  = [];
-        private readonly Func<IReadOnlyList<String>, String?>?         persist;
+        private readonly Lock                                                       gate     = new();
+        private readonly List<IDNSResourceRecord>                                   records  = [];
+        private readonly List<Zone>                                                 zones    = [];
+        private readonly Func<IReadOnlyList<String>, IReadOnlyList<Zone>, String?>? persist;
+        private readonly Func<DateTimeOffset>                                       now;
+
+        /// <summary>
+        /// What a question is looked up in: every zone with its own store,
+        /// the longest name first, and the store of the records in none.
+        /// </summary>
+        private sealed record Stores(IReadOnlyList<(Zone Zone, InMemoryDNSZone Store)>  Zones,
+                                     InMemoryDNSZone                                     Rest);
+
+        private volatile Stores stores = new ([], new InMemoryDNSZone());
 
         /// <summary>
         /// The types of record that are added and removed at the command line,
@@ -71,9 +91,22 @@ namespace cloud.charging.open.DNSServer
         #region Properties
 
         /// <summary>
-        /// What the DNS server looks up in.
+        /// The TTL of the SOA and NS records the zones make.
         /// </summary>
-        public InMemoryDNSZone  Zone    { get; } = new ();
+        public TimeSpan  DefaultTTL  { get; }
+
+        /// <summary>
+        /// Every zone the name server is authoritative for, in the order they
+        /// were added.
+        /// </summary>
+        public IReadOnlyList<Zone> Zones
+        {
+            get
+            {
+                lock (gate)
+                    return [ .. zones ];
+            }
+        }
 
         /// <summary>
         /// Every record, in the order they were added.
@@ -104,12 +137,18 @@ namespace cloud.charging.open.DNSServer
         #region Constructor(s)
 
         /// <summary>
-        /// The records of a name server.
+        /// The records and zones of a name server.
         /// </summary>
-        /// <param name="Persist">Writes the records, as zone-file lines, to where they are kept between starts: null where that worked, why not otherwise. Null to keep them in memory only.</param>
-        public ResourceRecords(Func<IReadOnlyList<String>, String?>? Persist = null)
+        /// <param name="DefaultTTL">The TTL of the SOA and NS records the zones make.</param>
+        /// <param name="Persist">Writes the records, as zone-file lines, and the zones to where they are kept between starts: null where that worked, why not otherwise. Null to keep them in memory only.</param>
+        /// <param name="Now">What time it is, for the serials of the zones; the clock by default.</param>
+        public ResourceRecords(TimeSpan                                                     DefaultTTL,
+                               Func<IReadOnlyList<String>, IReadOnlyList<Zone>, String?>?  Persist  = null,
+                               Func<DateTimeOffset>?                                        Now      = null)
         {
-            this.persist = Persist;
+            this.DefaultTTL  = DefaultTTL;
+            this.persist     = Persist;
+            this.now         = Now ?? (() => DateTimeOffset.UtcNow);
         }
 
         #endregion
@@ -155,25 +194,60 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
-        #region Load(Records)
+        #region TryLoad(Records, Zones, out Error)
 
         /// <summary>
-        /// Take the given records in, as they were read at the start - without
-        /// writing them anywhere.
+        /// Take the given records and zones in, as they were read at the start -
+        /// without writing them anywhere.
         /// </summary>
-        public void Load(IEnumerable<IDNSResourceRecord> Records)
+        /// <remarks>
+        /// Refused, with nothing taken in, where two zones have the same name,
+        /// or where the records hold an SOA or NS record, or a CNAME, at the
+        /// name of a zone: its SOA and NS records are the zone's to make, and a
+        /// name with a CNAME has no other record (RFC 1034 §3.6.2).
+        /// </remarks>
+        public Boolean TryLoad(IEnumerable<IDNSResourceRecord>   Records,
+                               IEnumerable<Zone>                 Zones,
+                               [NotNullWhen(false)] out String?  Error)
         {
+
+            var loadedRecords  = Records.ToList();
+            var loadedZones    = new List<Zone>();
+
+            foreach (var zone in Zones)
+            {
+
+                if (loadedZones.Any(loaded => loaded.Apex == zone.Apex))
+                {
+                    Error = $"The zone {zone.Name.FullName} is there twice.";
+                    return false;
+                }
+
+                if (AtTheApex(loadedRecords, zone) is IDNSResourceRecord clash)
+                {
+                    Error = $"{ClashAtTheApex(zone, clash)} Take '{Regex.Replace(clash.ToZoneFileString().Trim(), @"\s+", " ")}' out of the records.";
+                    return false;
+                }
+
+                loadedZones.Add(zone);
+
+            }
 
             lock (gate)
             {
 
-                foreach (var record in Records)
-                {
-                    records.Add(record);
-                    Zone.Add(record);
-                }
+                records.Clear();
+                records.AddRange(loadedRecords);
+
+                zones.Clear();
+                zones.AddRange(loadedZones);
+
+                Rebuild();
 
             }
+
+            Error = null;
+            return true;
 
         }
 
@@ -260,6 +334,13 @@ namespace cloud.charging.open.DNSServer
             lock (gate)
             {
 
+                if (Record is CNAME && zones.FirstOrDefault(zone => zone.Apex == name) is Zone apexOf)
+                {
+                    Error = $"{fullName} is the name of the zone {apexOf.Name.FullName}, with its SOA and NS records: " +
+                             "a name with a CNAME has no other record (RFC 1034 §3.6.2).";
+                    return false;
+                }
+
                 var atTheName = records.Where(record => Normalized(record.DomainName.FullName) == name).ToArray();
 
                 #region A name with a CNAME has no other record
@@ -298,13 +379,11 @@ namespace cloud.charging.open.DNSServer
                                         Append(Record).
                                         ToList();
 
-                if (!TryPersist(updated, out Error))
+                if (!TryCommit(updated, Counted(name), out Error))
                 {
                     NotSaved = true;
                     return false;
                 }
-
-                Apply(updated, Record.DomainName, Record.Type);
 
                 if (replaced.Length > 0)
                     Note = $"The other {type} record(s) of {fullName} have a TTL of {(Int64) Record.TimeToLive.TotalSeconds} s now as well: " +
@@ -354,10 +433,8 @@ namespace cloud.charging.open.DNSServer
 
                 var updated = records.Where(record => !gone.Contains(record)).ToList();
 
-                if (!TryPersist(updated, out Error))
+                if (!TryCommit(updated, Counted(name), out Error))
                     return false;
-
-                Apply(updated, gone[0].DomainName, Type);
 
                 Removed = gone;
 
@@ -526,48 +603,303 @@ namespace cloud.charging.open.DNSServer
         #endregion
 
 
-        #region (private) TryPersist(Updated, out Error)
-
-        private Boolean TryPersist(IReadOnlyList<IDNSResourceRecord>  Updated,
-                                   [NotNullWhen(false)] out String?   Error)
-        {
-
-            Error = persist?.Invoke([ .. Updated.Select(record => record.ToZoneFileString()) ]);
-
-            return Error is null;
-
-        }
-
-        #endregion
-
-        #region (private) Apply(Updated, Name, Type)
+        #region TryAddZone(Zone, out Error, out NotSaved)
 
         /// <summary>
-        /// The list as given from now on, and the RRset of the given name and
-        /// type in the zone made anew from it.
+        /// One zone more: the name server is authoritative for its name and
+        /// everything below it, with the SOA and NS records it makes.
         /// </summary>
-        private void Apply(List<IDNSResourceRecord>  Updated,
-                           DNSServiceName            Name,
-                           DNSResourceRecordTypes    Type)
+        /// <remarks>
+        /// Refused where the zone is there already, and where the records hold
+        /// an SOA or NS record, or a CNAME, at its name.
+        /// </remarks>
+        /// <param name="Zone">The zone.</param>
+        /// <param name="Error">Why it was not added.</param>
+        /// <param name="NotSaved">Whether it was not added because it could not be written: not the caller's fault.</param>
+        public Boolean TryAddZone(Zone                              Zone,
+                                  [NotNullWhen(false)] out String?  Error,
+                                  out Boolean                       NotSaved)
         {
 
-            records.Clear();
-            records.AddRange(Updated);
+            NotSaved = false;
 
-            var name   = Normalized(Name.FullName);
-            var rrset  = records.Where(record => Normalized(record.DomainName.FullName) == name && record.Type == Type).ToArray();
+            lock (gate)
+            {
 
-            // Set replaces the RRset in one step, so that a lookup in between
-            // never finds the name without the records it keeps.
-            if (rrset.Length > 0)
-                Zone.Set(rrset);
-            else
-                Zone.Remove(Name, Type);
+                if (zones.FirstOrDefault(zone => zone.Apex == Zone.Apex) is Zone there)
+                {
+                    Error = $"The name server is authoritative for {there.Name.FullName} already.";
+                    return false;
+                }
+
+                if (AtTheApex(records, Zone) is IDNSResourceRecord clash)
+                {
+                    Error = $"{ClashAtTheApex(Zone, clash)} Remove it first.";
+                    return false;
+                }
+
+                if (!TryCommit(records, [ .. zones, Zone ], out Error))
+                {
+                    NotSaved = true;
+                    return false;
+                }
+
+                return true;
+
+            }
 
         }
 
         #endregion
 
+        #region TryRemoveZone(Name, out Removed, out Error)
+
+        /// <summary>
+        /// The name server is no longer authoritative for the zone of the given
+        /// name. Its records stay, and are answered by their name exactly, as
+        /// every record in no zone is.
+        /// </summary>
+        /// <param name="Name">The name of the zone; a trailing dot is optional.</param>
+        /// <param name="Removed">The zone, or null where there was none of that name.</param>
+        /// <param name="Error">Why it was not removed, though it was there: it could not be written.</param>
+        public Boolean TryRemoveZone(String                            Name,
+                                     out Zone?                         Removed,
+                                     [NotNullWhen(false)] out String?  Error)
+        {
+
+            Removed  = null;
+            Error    = null;
+
+            var name = Normalized(Name);
+
+            lock (gate)
+            {
+
+                if (zones.FirstOrDefault(zone => zone.Apex == name) is not Zone gone)
+                    return true;
+
+                if (!TryCommit(records, [ .. zones.Where(zone => zone != gone) ], out Error))
+                    return false;
+
+                Removed = gone;
+                return true;
+
+            }
+
+        }
+
+        #endregion
+
+        #region ZoneOf(Name)
+
+        /// <summary>
+        /// The zone the given name is in - the one with the longest name, where
+        /// zones are within each other - or null where it is in none.
+        /// </summary>
+        public Zone? ZoneOf(String Name)
+        {
+
+            var name = Normalized(Name);
+
+            lock (gate)
+                return zones.Where          (zone => zone.Contains(name)).
+                             OrderByDescending(zone => zone.Apex.Length).
+                             FirstOrDefault();
+
+        }
+
+        #endregion
+
+        #region MadeByTheZones()
+
+        /// <summary>
+        /// The SOA and NS records every zone makes, zone by zone.
+        /// </summary>
+        public IReadOnlyList<IDNSResourceRecord> MadeByTheZones()
+        {
+
+            lock (gate)
+                return [ .. zones.SelectMany(zone => MadeBy(zone)) ];
+
+        }
+
+        /// <summary>
+        /// The SOA and NS records the given zone makes.
+        /// </summary>
+        public IReadOnlyList<IDNSResourceRecord> MadeBy(Zone Zone)
+
+            => [ Zone.SOA(DefaultTTL), .. Zone.NS(DefaultTTL) ];
+
+        #endregion
+
+        #region NameServersWithoutAddress(Zone)
+
+        /// <summary>
+        /// The name servers of the zone that are in it and have no A or AAAA
+        /// record: a resolver sent to them by the NS records cannot find them.
+        /// </summary>
+        public IReadOnlyList<DomainName> NameServersWithoutAddress(Zone Zone)
+        {
+
+            lock (gate)
+                return [ .. Zone.NameServers.Where(nameServer => {
+
+                                                       var name = Normalized(nameServer.FullName);
+
+                                                       return Zone.Contains(name) &&
+                                                              !records.Any(record => record.Type is DNSResourceRecordTypes.A
+                                                                                                 or DNSResourceRecordTypes.AAAA &&
+                                                                                     Normalized(record.DomainName.FullName) == name);
+
+                                                   }) ];
+
+        }
+
+        #endregion
+
+
+        #region Lookup(Question, DNSSECOK, CancellationToken)
+
+        /// <summary>
+        /// Answer one question: from the zone its name is in, or from the
+        /// records in no zone.
+        /// </summary>
+        public async Task<DNSZoneLookupResult> Lookup(DNSQuestion        Question,
+                                                      Boolean            DNSSECOK            = false,
+                                                      CancellationToken  CancellationToken   = default)
+        {
+
+            var current  = stores;
+            var name     = Normalized(Question.DomainName.FullName);
+
+            foreach (var (zone, store) in current.Zones)
+                if (zone.Contains(name))
+                    return await store.Lookup(Question, DNSSECOK, CancellationToken).ConfigureAwait(false);
+
+            var result = await current.Rest.Lookup(Question, DNSSECOK, CancellationToken).ConfigureAwait(false);
+
+            // Above a zone, a name that is not held is no name that does not
+            // exist: the zone's names are below it. NXDOMAIN would deny them too
+            // (RFC 8020 §2), and it is no name the server is authoritative for.
+            return result.Status == DNSZoneLookupStatus.NameError &&
+                   current.Zones.Any(served => Zone.IsAtOrBelow(served.Zone.Apex, name))
+                       ? DNSZoneLookupResult.NotAuthoritative(HoldsNamesBelow: true)
+                       : result;
+
+        }
+
+        #endregion
+
+
+        #region (private static) AtTheApex(Records, Zone) / ClashAtTheApex(Zone, Record)
+
+        /// <summary>
+        /// The record at the name of the zone that the zone cannot be beside:
+        /// an SOA or NS record - the zone makes its own - or a CNAME.
+        /// </summary>
+        private static IDNSResourceRecord? AtTheApex(IEnumerable<IDNSResourceRecord>  Records,
+                                                     Zone                             Zone)
+
+            => Records.FirstOrDefault(record => record.Type is DNSResourceRecordTypes.SOA
+                                                            or DNSResourceRecordTypes.NS
+                                                            or DNSResourceRecordTypes.CNAME &&
+                                                Normalized(record.DomainName.FullName) == Zone.Apex);
+
+        private static String ClashAtTheApex(Zone                Zone,
+                                             IDNSResourceRecord  Record)
+
+            => Record is CNAME cname
+                   ? $"{Zone.Name.FullName} is an alias of {cname.CName.FullName}: the name of a zone has its SOA and NS records, and a name with a CNAME has no other record (RFC 1034 §3.6.2)."
+                   : $"The records hold an {ADNSResourceRecord.TypeName(Record.Type)} record at {Zone.Name.FullName}: the zone makes its SOA and NS records itself.";
+
+        #endregion
+
+        #region (private) Counted(Name)
+
+        /// <summary>
+        /// The zones, with the serial of the one the given name is in counted
+        /// on: a change of one of its records is a change of the zone.
+        /// </summary>
+        private List<Zone> Counted(String Name)
+        {
+
+            var changed = zones.Where          (zone => zone.Contains(Name)).
+                                OrderByDescending(zone => zone.Apex.Length).
+                                FirstOrDefault();
+
+            return [ .. zones.Select(zone => zone == changed
+                                                 ? zone with { Serial = Zone.NextSerial(zone.Serial, now()) }
+                                                 : zone) ];
+
+        }
+
+        #endregion
+
+        #region (private) TryCommit(Records, Zones, out Error)
+
+        /// <summary>
+        /// Write the given records and zones, and - where that worked - answer
+        /// with them from now on; change nothing otherwise.
+        /// </summary>
+        private Boolean TryCommit(IReadOnlyList<IDNSResourceRecord>  Records,
+                                  IReadOnlyList<Zone>                Zones,
+                                  [NotNullWhen(false)] out String?   Error)
+        {
+
+            Error = persist?.Invoke([ .. Records.Select(record => record.ToZoneFileString()) ], Zones);
+
+            if (Error is not null)
+                return false;
+
+            // Copied first: the records given may be the list itself.
+            var updatedRecords  = Records.ToArray();
+            var updatedZones    = Zones.  ToArray();
+
+            records.Clear();
+            records.AddRange(updatedRecords);
+
+            zones.Clear();
+            zones.AddRange(updatedZones);
+
+            Rebuild();
+
+            return true;
+
+        }
+
+        #endregion
+
+        #region (private) Rebuild()
+
+        /// <summary>
+        /// The stores made anew from the records and zones, and put in place in
+        /// one step: a lookup in between finds either all of what was before, or
+        /// all of what is now.
+        /// </summary>
+        private void Rebuild()
+        {
+
+            var served = zones.OrderByDescending(zone => zone.Apex.Length).
+                               Select(zone => (Zone: zone, Store: new InMemoryDNSZone().Add(MadeBy(zone)))).
+                               ToArray();
+
+            var rest   = new InMemoryDNSZone();
+
+            foreach (var record in records)
+            {
+
+                var name   = Normalized(record.DomainName.FullName);
+                var store  = served.FirstOrDefault(zone => zone.Zone.Contains(name)).Store ?? rest;
+
+                store.Add(record);
+
+            }
+
+            stores = new Stores(served, rest);
+
+        }
+
+        #endregion
     }
 
 }

@@ -197,6 +197,140 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+        #region AddZone(Name, NameServers, By)
+
+        /// <summary>
+        /// The name server is authoritative for the zone of the given name from
+        /// now on, with the SOA and NS records it makes - as the command line's
+        /// "zones add" and the JSON API's ADD v1/dnsServer/zones say it.
+        /// </summary>
+        /// <param name="Name">The name of the zone; a trailing dot is optional.</param>
+        /// <param name="NameServers">The name servers its NS records name, the first the primary of its SOA - or none for "ns." and the zone.</param>
+        /// <param name="By">Who added it, for the log.</param>
+        public RecordsChange AddZone(String               Name,
+                                     IEnumerable<String>  NameServers,
+                                     String               By)
+        {
+
+            if (!TryParseZoneName(Name, out var zoneName, out var error))
+                return new (error, null, RecordsChangeOutcome.Refused);
+
+            var nameServers = new List<DomainName>();
+
+            foreach (var nameServer in NameServers.Where(nameServer => !String.IsNullOrWhiteSpace(nameServer)))
+            {
+
+                if (!ResourceRecords.TryParseName(nameServer, out var nameServerName, out error))
+                    return new (error, null, RecordsChangeOutcome.Refused);
+
+                if (nameServers.Any(known => ResourceRecords.Normalized(known.FullName) == ResourceRecords.Normalized(nameServerName.FullName)))
+                    return new ($"{nameServerName.FullName} is given twice.", null, RecordsChangeOutcome.Refused);
+
+                nameServers.Add(nameServerName);
+
+            }
+
+            var zone = Zone.New(zoneName, nameServers, DateTimeOffset.UtcNow);
+
+            if (!Records.TryAddZone(zone, out error, out var notSaved))
+                return new (error, null, notSaved ? RecordsChangeOutcome.NotSaved : RecordsChangeOutcome.Refused);
+
+            var said = $"The name server is authoritative for {zone.Name.FullName} from now on: " +
+                       $"its SOA names {zone.NameServers[0].FullName} as the primary and {zone.Hostmaster} as the hostmaster, " +
+                       $"its NS records {String.Join(", ", zone.NameServers.Select(nameServer => nameServer.FullName))}; serial {zone.Serial}.";
+
+            Log.Notice($"{said} ({By})", "dnsserver", "zones");
+
+            return new (said, WithoutAddressNote(zone), RecordsChangeOutcome.Changed);
+
+        }
+
+        #endregion
+
+        #region RemoveZone(Name, By)
+
+        /// <summary>
+        /// The name server is no longer authoritative for the zone of the given
+        /// name - as the command line's "zones remove" and the JSON API's
+        /// REMOVE v1/dnsServer/zones say it. Its records stay.
+        /// </summary>
+        /// <param name="Name">The name of the zone; a trailing dot is optional.</param>
+        /// <param name="By">Who removed it, for the log.</param>
+        public RecordsChange RemoveZone(String  Name,
+                                        String  By)
+        {
+
+            if (!TryParseZoneName(Name, out var zoneName, out var error))
+                return new (error, null, RecordsChangeOutcome.Refused);
+
+            if (!Records.TryRemoveZone(zoneName.FullName, out var removed, out var notSaved))
+                return new (notSaved, null, RecordsChangeOutcome.NotSaved);
+
+            if (removed is null)
+                return new ($"The name server is not authoritative for {zoneName.FullName}: nothing was removed.", null, RecordsChangeOutcome.NothingMatched);
+
+            var said = $"The name server is no longer authoritative for {removed.Name.FullName}: its SOA and NS records are gone, " +
+                        "and its records are answered by their name alone.";
+
+            Log.Notice($"{said} ({By})", "dnsserver", "zones");
+
+            return new (said, null, RecordsChangeOutcome.Changed);
+
+        }
+
+        #endregion
+
+        #region WithoutAddressNote(Zone)
+
+        /// <summary>
+        /// What the zone lacks to be found: where a name server of it is in it
+        /// and has no address, a resolver sent there cannot find it.
+        /// </summary>
+        public String? WithoutAddressNote(Zone Zone)
+        {
+
+            var missing = Records.NameServersWithoutAddress(Zone);
+
+            return missing.Count > 0
+                       ? $"{String.Join(", ", missing.Select(nameServer => nameServer.FullName))} {(missing.Count == 1 ? "has" : "have")} no address yet: " +
+                         $"a resolver sent there cannot find this name server. Add one - aRecords add {missing[0].FullName} <IPv4>."
+                       : null;
+
+        }
+
+        #endregion
+
+        #region (private static) TryParseZoneName(Text, out Name, out Error)
+
+        /// <summary>
+        /// The name of a zone: complete, and not the root.
+        /// </summary>
+        private static Boolean TryParseZoneName(String                                Text,
+                                                [NotNullWhen(true)]  out DomainName?  Name,
+                                                [NotNullWhen(false)] out String?      Error)
+        {
+
+            Name = null;
+
+            if (String.IsNullOrWhiteSpace(Text) || Text.Trim() == ".")
+            {
+                Error = "A zone needs a name, and the root is none for this name server.";
+                return false;
+            }
+
+            if (Text.Contains('*'))
+            {
+                Error = $"'{Text.Trim()}' is no name of a zone: a zone has no wildcard in its name.";
+                return false;
+            }
+
+            return ResourceRecords.TryParseName(Text, out Name, out Error);
+
+        }
+
+        #endregion
+
+
         #region (static) TryMake(Type, Name, Data, TTL, out Record, out Error)
 
         /// <summary>
@@ -294,6 +428,27 @@ namespace cloud.charging.open.DNSServer
         public JArray RecordsJSON()
 
             => new (Records.All.Select(RecordJSON));
+
+        #endregion
+
+        #region ZonesJSON()
+
+        /// <summary>
+        /// Every zone, in the order they were added: what it is, the SOA and NS
+        /// records it makes, and what it lacks to be found.
+        /// </summary>
+        public JArray ZonesJSON()
+
+            => new (Records.Zones.Select(zone => {
+
+                        var json = zone.ToJSON();
+
+                        json.Add(new JProperty("records",  new JArray(Records.MadeBy(zone).Select(RecordJSON))));
+                        json.Add(new JProperty("note",     WithoutAddressNote(zone)));
+
+                        return json;
+
+                    }));
 
         #endregion
 

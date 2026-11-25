@@ -79,6 +79,9 @@ namespace cloud.charging.open.DNSServer.CommandLine
                                        ? $" - {String.Join(", ", records.GroupBy(record => record.Type).OrderBy(group => group.Key.ToString()).Select(group => $"{group.Count()} {group.Key}"))}; " +
                                          $"see '{RecordsCommand.CommandName}'"
                                        : $" - '{ARecordsCommand.CommandName} add <name> <IPv4>' adds one"),
+                $"zones           {(node.Records.Zones.Count > 0
+                                        ? $"{String.Join(", ", node.Records.Zones.Select(zone => zone.Name.FullName))}; see '{ZonesCommand.CommandName}'"
+                                        : $"none - '{ZonesCommand.CommandName} add <zone>' adds one, with its SOA and NS records")}",
                 $"default TTL     {(Int64) node.Settings.DefaultTTL.TotalSeconds} s",
                 $"answered        {node.ResponsesSent} response(s) to {node.RequestsReceived} request(s)"
             ];
@@ -93,7 +96,7 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
         public override String Help()
 
-            => $"{CommandName} - how the name server stands: where it listens, its records, how much it answered";
+            => $"{CommandName} - how the name server stands: where it listens, its records and zones, how much it answered";
 
         #endregion
 

@@ -43,6 +43,9 @@ namespace cloud.charging.open.DNSServer
     ///   <item>GET  /api/v1/dnsServer/records                 - every record: its name, type, class, TTL, data and value, and its zone-file line.</item>
     ///   <item>ADD    /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target", "ttl"? }: the name answers with the record as well - answered with { "said", "note", "records" }.</item>
     ///   <item>REMOVE /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target"? }: the name no longer answers with the record, or with any of the type - answered with { "said", "records" }.</item>
+    ///   <item>GET    /api/v1/dnsServer/zones                 - every zone the name server is authoritative for: its name, name servers, hostmaster, serial and timers, the SOA and NS records it makes, and a "note" on what it lacks.</item>
+    ///   <item>ADD    /api/v1/dnsServer/zones                 - { "name", "nameServers"? }: the name server is authoritative for the zone from now on - answered with { "said", "note", "zones" }.</item>
+    ///   <item>REMOVE /api/v1/dnsServer/zones                 - { "name" }: it no longer is; its records stay - answered with { "said", "zones" }.</item>
     /// </list>
     /// {type} is a, aaaa, txt or cname; A and AAAA records carry an "address",
     /// TXT records a "text", taken as it is, and a CNAME the "target" it is an
@@ -104,6 +107,9 @@ namespace cloud.charging.open.DNSServer
             AddHandler(root,                         GetStatus,     HTTPMethod.GET);
             AddHandler(root + "/settings",           GetSettings,   HTTPMethod.GET);
             AddHandler(root + "/records",            GetRecords,    HTTPMethod.GET);
+            AddHandler(root + "/zones",              GetZones,      HTTPMethod.GET);
+            AddHandler(root + "/zones",              AddZone,       HTTPMethod.ADD);
+            AddHandler(root + "/zones",              RemoveZone,    REMOVE);
 
             // records/a, records/aaaa, records/txt, records/cname: ADD a
             // record, REMOVE one or every one of a name.
@@ -163,6 +169,80 @@ namespace cloud.charging.open.DNSServer
         }
 
         #endregion
+
+        #region (private) GetZones(Request)
+
+        private Task<HTTPResponse> GetZones(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Read(DNSServerAccess.NameServer), false, out _, out var refused))
+                return Task.FromResult(refused);
+
+            return Task.FromResult(JSONResponse(Request, HTTPStatusCode.OK, DNSServer.ZonesJSON()));
+
+        }
+
+        #endregion
+
+        #region (private) AddZone(Request)
+
+        /// <summary>
+        /// One zone more, as the command line's "zones add".
+        /// </summary>
+        private Task<HTTPResponse> AddZone(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))
+                return Task.FromResult(refused);
+
+            if (!TryParseJSONObject(Request, out var json, out var badRequest))
+                return Task.FromResult(badRequest);
+
+            if (!TryText(json, "name", true, true, out var name, out var problem))
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, problem));
+
+            var nameServers = new List<String>();
+
+            if (json["nameServers"] is JToken nameServersToken && nameServersToken.Type != JTokenType.Null)
+            {
+
+                if (nameServersToken is not JArray nameServersArray ||
+                    nameServersArray.Any(nameServer => nameServer.Type != JTokenType.String))
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "\"nameServers\" is a list of names."));
+
+                nameServers.AddRange(nameServersArray.Select(nameServer => nameServer.Value<String>()!));
+
+            }
+
+            return Task.FromResult(Answer(Request, DNSServer.AddZone(name!, nameServers, user.Id.ToString()), Zones: true));
+
+        }
+
+        #endregion
+
+        #region (private) RemoveZone(Request)
+
+        /// <summary>
+        /// One zone less, as the command line's "zones remove".
+        /// </summary>
+        private Task<HTTPResponse> RemoveZone(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))
+                return Task.FromResult(refused);
+
+            if (!TryParseJSONObject(Request, out var json, out var badRequest))
+                return Task.FromResult(badRequest);
+
+            if (!TryText(json, "name", true, true, out var name, out var problem))
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, problem));
+
+            return Task.FromResult(Answer(Request, DNSServer.RemoveZone(name!, user.Id.ToString()), Zones: true));
+
+        }
+
+        #endregion
+
 
         #region (static) KeyOf(Type)
 
@@ -246,21 +326,25 @@ namespace cloud.charging.open.DNSServer
         #endregion
 
 
-        #region (private) Answer(Request, Change)
+        #region (private) Answer(Request, Change, Zones = false)
 
         /// <summary>
-        /// What a change came to: what it said, and the records as they are now
-        /// - or why nothing changed, with the status that says whose fault.
+        /// What a change came to: what it said, and the records - or the zones -
+        /// as they are now; or why nothing changed, with the status that says
+        /// whose fault.
         /// </summary>
         private HTTPResponse Answer(HTTPRequest    Request,
-                                    RecordsChange  Change)
+                                    RecordsChange  Change,
+                                    Boolean        Zones   = false)
 
             => Change.Outcome switch {
 
                    RecordsChangeOutcome.Changed         => JSONResponse(Request, HTTPStatusCode.OK, new JObject(
                                                                new JProperty("said",     Change.Said),
                                                                new JProperty("note",     Change.Note),
-                                                               new JProperty("records",  DNSServer.RecordsJSON())
+                                                               Zones
+                                                                   ? new JProperty("zones",    DNSServer.ZonesJSON())
+                                                                   : new JProperty("records",  DNSServer.RecordsJSON())
                                                            )),
 
                    RecordsChangeOutcome.NothingMatched  => ErrorJSON(Request, HTTPStatusCode.NotFound,            Change.Said),

@@ -237,6 +237,84 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region TheZonesAreChangedOverTheJSONAPI()
+
+        /// <summary>
+        /// A zone added with ADD and removed with REMOVE: listed with the SOA and
+        /// NS records it makes and what it lacks to be found, its serial counted
+        /// on by a record of it, and what cannot be a zone refused.
+        /// </summary>
+        [Test]
+        public async Task TheZonesAreChangedOverTheJSONAPI()
+        {
+
+            using var http          = await SignedIn();
+
+            var (added, answer)     = await Send(http, ADD,    "api/v1/dnsServer/zones",
+                                                 new JObject(new JProperty("name",         "example.org"),
+                                                             new JProperty("nameServers",  new JArray("ns1.example.org", "ns2.example.net"))));
+
+            Assert.That(added,                                         Is.EqualTo(HttpStatusCode.OK), answer.ToString());
+            Assert.That(answer["said"]!.Value<String>(),               Does.Contain("authoritative for example.org. from now on"));
+            Assert.That(answer["note"]!.Value<String>(),               Does.StartWith("ns1.example.org. has no address yet"));
+
+            var zone                = answer["zones"]![0]!;
+
+            Assert.Multiple(() => {
+                Assert.That(answer["zones"]!.Count(),                  Is.EqualTo(1));
+                Assert.That(zone["name"]!.Value<String>(),             Is.EqualTo("example.org."));
+                Assert.That(zone["nameServers"]!.Values<String>(),     Is.EqualTo(new[] { "ns1.example.org.", "ns2.example.net." }));
+                Assert.That(zone["hostmaster"]!.Value<String>(),       Is.EqualTo("hostmaster@example.org"));
+                Assert.That(zone["records"]!.Select(record => record["type"]!.Value<String>()), Is.EqualTo(new[] { "SOA", "NS", "NS" }));
+                Assert.That(zone["records"]![0]!["data"]!.Value<String>(), Does.StartWith("ns1.example.org. hostmaster.example.org. "));
+            });
+
+            var serial              = zone["serial"]!.Value<UInt32>();
+
+            await Send(http, ADD, "api/v1/dnsServer/records/a",
+                       new JObject(new JProperty("name",     "ns1.example.org"),
+                                   new JProperty("address",  "192.0.2.53")));
+
+            var zones               = JArray.Parse(await http.GetStringAsync("api/v1/dnsServer/zones"));
+
+            Assert.Multiple(() => {
+                Assert.That(zones[0]["serial"]!.Value<UInt32>(),       Is.EqualTo(serial + 1));
+                Assert.That(zones[0]["note"]!.Type,                    Is.EqualTo(JTokenType.Null), "ns1.example.org. has its address now");
+            });
+
+            var status              = await GetJSON(http, "api/v1/dnsServer");
+
+            Assert.That(status["zones"]!.Values<String>(),             Is.EqualTo(new[] { "example.org." }));
+
+            var (again, why)        = await Send(http, ADD,    "api/v1/dnsServer/zones",
+                                                 new JObject(new JProperty("name",         "example.org.")));
+
+            var (badList, notNames) = await Send(http, ADD,    "api/v1/dnsServer/zones",
+                                                 new JObject(new JProperty("name",         "example.com"),
+                                                             new JProperty("nameServers",  "ns.example.com")));
+
+            Assert.Multiple(() => {
+                Assert.That(again,                                     Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
+                Assert.That(why.ToString(),                            Does.Contain("already"));
+                Assert.That(badList,                                   Is.EqualTo(HttpStatusCode.BadRequest), notNames.ToString());
+            });
+
+            var (removed, after)    = await Send(http, REMOVE, "api/v1/dnsServer/zones",
+                                                 new JObject(new JProperty("name",         "EXAMPLE.org")));
+
+            Assert.That(removed,                                       Is.EqualTo(HttpStatusCode.OK), after.ToString());
+            Assert.That(after["zones"]!.Count(),                       Is.Zero);
+            Assert.That(((DNSServerNode) Node).Records.Count,          Is.EqualTo(1), "its records stay");
+
+            var (nothing, said)     = await Send(http, REMOVE, "api/v1/dnsServer/zones",
+                                                 new JObject(new JProperty("name",         "example.org")));
+
+            Assert.That(nothing,                                       Is.EqualTo(HttpStatusCode.NotFound), said.ToString());
+
+        }
+
+        #endregion
+
         #region AnOperatorMayReadTheRecordsButNotChangeThem()
 
         [Test]

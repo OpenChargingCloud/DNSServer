@@ -268,17 +268,23 @@ namespace cloud.charging.open.DNSServer
                 throw new InvalidOperationException($"'{this.ConfigFile.Path}': \"records\" of the \"{DNSServerSettings.SectionName}\" section: {recordsError} " +
                                                     $"Repair or remove the record and start again.");
 
-            this.Records = new ResourceRecords(WriteRecords);
-            this.Records.Load(records);
+            this.Records = new ResourceRecords(Settings.DefaultTTL, WriteRecords);
 
-            this.Log.Info($"The name server answers with {records.Count} record(s) of the \"{DNSServerSettings.SectionName}\" section.", "dnsserver");
+            if (!this.Records.TryLoad(records, Settings.Zones, out var zonesError))
+                throw new InvalidOperationException($"'{this.ConfigFile.Path}': \"zones\" of the \"{DNSServerSettings.SectionName}\" section: {zonesError}");
+
+            this.Log.Info($"The name server answers with {records.Count} record(s) of the \"{DNSServerSettings.SectionName}\" section" +
+                          (Settings.Zones.Count > 0
+                               ? $", and is authoritative for {Settings.Zones.Count} zone(s): {String.Join(", ", Settings.Zones.Select(zone => zone.Name.FullName))}"
+                               : "."),
+                          "dnsserver");
 
             #endregion
 
             #region The name server
 
             this.Server = new HermodDNSServer(
-                              new AuthoritativeDNSRequestHandler(Records.Zone),
+                              new AuthoritativeDNSRequestHandler(Records),
                               new DNSServerOptions {
                                   EnableUDPUnicast    = Settings.UDP,
                                   EnableTCPUnicast    = Settings.TCP,
@@ -327,20 +333,23 @@ namespace cloud.charging.open.DNSServer
         #endregion
 
 
-        #region (private) WriteRecords(Lines)
+        #region (private) WriteRecords(Lines, Zones)
 
         /// <summary>
-        /// The records into the "dnsServer" section, and nothing else of it.
+        /// The records and zones into the "dnsServer" section, and nothing else
+        /// of it.
         /// </summary>
-        private String? WriteRecords(IReadOnlyList<String> Lines)
+        private String? WriteRecords(IReadOnlyList<String>  Lines,
+                                     IReadOnlyList<Zone>    Zones)
         {
 
             if (!ConfigFile.TryMergeSection(DNSServerSettings.SectionName,
-                                            new JObject(new JProperty("records", new JArray(Lines))),
+                                            new JObject(new JProperty("records", new JArray(Lines)),
+                                                        new JProperty("zones",   new JArray(Zones.Select(zone => zone.ToJSON())))),
                                             out var error))
                 return error;
 
-            Settings = Settings with { Records = Lines };
+            Settings = Settings with { Records = Lines, Zones = Zones };
 
             return null;
 
@@ -449,7 +458,11 @@ namespace cloud.charging.open.DNSServer
 
             Log.Info($"The JSON API of the name server is at {APIURL}v1/dnsServer", "web", "http");
 
-            Log.Notice($"DNS is answered {ListenersText()}, with {Records.Count} record(s).", "dnsserver");
+            Log.Notice($"DNS is answered {ListenersText()}, with {Records.Count} record(s)" +
+                       (Records.Zones.Count > 0
+                            ? $" and {Records.Zones.Count} zone(s)."
+                            : "."),
+                       "dnsserver");
 
             return Task.CompletedTask;
 
@@ -507,6 +520,7 @@ namespace cloud.charging.open.DNSServer
                    new JProperty("udp",               UDPSocket?.ToString()),
                    new JProperty("tcp",               TCPSocket?.ToString()),
                    new JProperty("records",           Records.Count),
+                   new JProperty("zones",             new JArray(Records.Zones.Select(zone => zone.Name.FullName))),
                    new JProperty("recordTypes",       new JObject(Records.All.
                                                                       GroupBy (record => ADNSResourceRecord.TypeName(record.Type)).
                                                                       OrderBy (group  => group.Key, StringComparer.Ordinal).

@@ -42,13 +42,16 @@ namespace cloud.charging.open.DNSServer
     ///     "udp":         true,
     ///     "tcp":         true,
     ///     "defaultTTL":  3600,
-    ///     "records":     [ "www.example.org. 3600 IN A 192.0.2.10" ]
+    ///     "records":     [ "www.example.org. 3600 IN A 192.0.2.10" ],
+    ///     "zones":       [ { "name": "example.org." } ]
     /// }
     /// </code>
     /// Every key may be left out, and then reads as its default. The records
     /// are zone-file lines (RFC 1035 §5.1), each with its name complete: that
     /// is the one form every kind of record has, so that a record the command
-    /// line cannot make yet can still be written into the file by hand.
+    /// line cannot make yet can still be written into the file by hand. The
+    /// zones are those the name server is authoritative for, with the SOA and
+    /// NS records it makes for them (see <see cref="Zone"/>).
     /// </remarks>
     public sealed record DNSServerSettings
     {
@@ -103,6 +106,11 @@ namespace cloud.charging.open.DNSServer
         /// The resource records answered with, as zone-file lines.
         /// </summary>
         public IReadOnlyList<String>  Records       { get; init; } = [];
+
+        /// <summary>
+        /// The zones the name server is authoritative for.
+        /// </summary>
+        public IReadOnlyList<Zone>    Zones         { get; init; } = [];
 
         #endregion
 
@@ -229,6 +237,39 @@ namespace cloud.charging.open.DNSServer
 
             #endregion
 
+            #region zones
+
+            if (json["zones"] is JToken zonesToken && zonesToken.Type != JTokenType.Null)
+            {
+
+                if (zonesToken is not JArray zonesArray)
+                {
+                    Error = $"\"zones\" of the \"{SectionName}\" section is no list of zones.";
+                    return false;
+                }
+
+                var zones = new List<Zone>();
+                var now   = DateTimeOffset.UtcNow;
+
+                foreach (var zoneToken in zonesArray)
+                {
+
+                    if (!Zone.TryParse(zoneToken, now, out var zone, out var zoneError))
+                    {
+                        Error = $"\"zones\" of the \"{SectionName}\" section: {zoneError}";
+                        return false;
+                    }
+
+                    zones.Add(zone);
+
+                }
+
+                settings = settings with { Zones = zones };
+
+            }
+
+            #endregion
+
             if (!settings.UDP && !settings.TCP)
             {
                 Error = $"The \"{SectionName}\" section switches off both UDP and TCP: DNS would be answered nowhere.";
@@ -339,7 +380,8 @@ namespace cloud.charging.open.DNSServer
                    new JProperty("udp",         UDP),
                    new JProperty("tcp",         TCP),
                    new JProperty("defaultTTL",  (Int64) DefaultTTL.TotalSeconds),
-                   new JProperty("records",     new JArray(Records))
+                   new JProperty("records",     new JArray(Records)),
+                   new JProperty("zones",       new JArray(Zones.Select(zone => zone.ToJSON())))
                );
 
         #endregion

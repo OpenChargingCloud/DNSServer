@@ -198,6 +198,22 @@ namespace cloud.charging.open.DNSServer.Tests
                                                                                                                               Boolean        OverTCP = false)
         {
 
+            var (responseCode, authoritative, answers, _) = await AskForAll(Node, Name, Type, OverTCP);
+
+            return (responseCode, authoritative, answers);
+
+        }
+
+        /// <summary>
+        /// As <see cref="AskFor"/>, with the authority section as well: where a
+        /// negative answer says which zone it is from, with the zone's SOA.
+        /// </summary>
+        private static async Task<(Int32 ResponseCode, Boolean Authoritative, (UInt16 Type, String Data)[] Answers, (UInt16 Type, String Data)[] Authority)> AskForAll(DNSServerNode  Node,
+                                                                                                                                                                       String         Name,
+                                                                                                                                                                       UInt16         Type,
+                                                                                                                                                                       Boolean        OverTCP = false)
+        {
+
             var query = new List<Byte> { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
             foreach (var label in Name.TrimEnd('.').Split('.'))
@@ -244,12 +260,14 @@ namespace cloud.charging.open.DNSServer.Tests
 
             var flags     = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(2, 2));
             var count     = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(6, 2));
+            var nsCount   = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(8, 2));
 
             // Past the question: the name as it was sent, then type and class.
             var offset    = query.Count;
             var answers   = new List<(UInt16, String)>();
+            var authority = new List<(UInt16, String)>();
 
-            for (var i = 0; i < count; i++)
+            for (var i = 0; i < count + nsCount; i++)
             {
 
                 NameAt(response, ref offset);
@@ -261,10 +279,11 @@ namespace cloud.charging.open.DNSServer.Tests
 
                 var rdata     = offset;
 
-                answers.Add((type, type switch {
+                (i < count ? answers : authority).Add((type, type switch {
                     1  when rdLength ==  4  => new System.Net.IPAddress(response.AsSpan(offset, 4)). ToString(),
                     28 when rdLength == 16  => new System.Net.IPAddress(response.AsSpan(offset, 16)).ToString(),
-                    5                       => NameAt(response, ref rdata),
+                    2 or 5                  => NameAt(response, ref rdata),
+                    6                       => SOAAt(response, rdata),
                     16                      => TextAt(response, offset, rdLength),
                     _                       => Convert.ToHexString(response, offset, rdLength)
                 }));
@@ -273,7 +292,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             }
 
-            return (flags & 0x000F, (flags & 0x0400) != 0, [ .. answers ]);
+            return (flags & 0x000F, (flags & 0x0400) != 0, [ .. answers ], [ .. authority ]);
 
         }
 
@@ -312,6 +331,21 @@ namespace cloud.charging.open.DNSServer.Tests
                 Offset = at + 1;
 
             return String.Join('.', labels) + ".";
+
+        }
+
+        /// <summary>
+        /// The data of an SOA record as a zone file says it: "MNAME RNAME SERIAL
+        /// REFRESH RETRY EXPIRE MINIMUM".
+        /// </summary>
+        private static String SOAAt(Byte[] Message, Int32 Offset)
+        {
+
+            var mname   = NameAt(Message, ref Offset);
+            var rname   = NameAt(Message, ref Offset);
+            var numbers = Enumerable.Range(0, 5).Select(i => BinaryPrimitives.ReadUInt32BigEndian(Message.AsSpan(Offset + 4 * i, 4)));
+
+            return $"{mname} {rname} {String.Join(' ', numbers)}";
 
         }
 
@@ -736,6 +770,240 @@ namespace cloud.charging.open.DNSServer.Tests
 
             Assert.That(removed[0],         Does.Contain("no longer answers with"));
             Assert.That(node.Records.Count, Is.Zero);
+
+        }
+
+        #endregion
+
+        #region AZone_MakesItsSOAAndNS_AndAnswersForItsNames()
+
+        [Test]
+        public async Task AZone_MakesItsSOAAndNS_AndAnswersForItsNames()
+        {
+
+            var directory  = NewDirectory();
+            var first      = await Started(directory);
+
+            await AtTheConsole(first, "aRecords add www.example.org 192.0.2.10");
+            await AtTheConsole(first, "aRecords add ns.example.org 192.0.2.53");
+
+            var added      = await AtTheConsole(first, "zones add example.org");
+
+            Assert.That(added[0], Does.Contain("authoritative for example.org. from now on").
+                                  And.Contain("ns.example.org. as the primary").
+                                  And.Contain("hostmaster@example.org as the hostmaster"));
+
+            // ns.example.org has its address: nothing to say about it.
+            Assert.That(added, Has.Length.EqualTo(1));
+
+            var serial     = first.Records.Zones[0].Serial;
+
+            Assert.That(serial.ToString(), Does.Match(@"^20\d{6}00$"), "YYYYMMDD00, the first of the day");
+
+            var soa        = await AskFor(first, "example.org", 6);
+            var ns         = await AskFor(first, "example.org", 2, OverTCP: true);
+
+            Assert.Multiple(() => {
+                Assert.That(soa.Authoritative, Is.True);
+                Assert.That(soa.Answers, Is.EqualTo(new[] { ((UInt16) 6, $"ns.example.org. hostmaster.example.org. {serial} 86400 7200 1209600 3600") }));
+                Assert.That(ns. Answers, Is.EqualTo(new[] { ((UInt16) 2, "ns.example.org.") }));
+            });
+
+            // RFC 2308: a "no" says the zone it is from, with its SOA, so that
+            // a resolver may keep it for the SOA's MINIMUM.
+            var noName     = await AskForAll(first, "nope.example.org", 1);
+            var noData     = await AskForAll(first, "www.example.org", 16);
+
+            Assert.Multiple(() => {
+                Assert.That(noName.ResponseCode,  Is.EqualTo(3), "NXDOMAIN");
+                Assert.That(noName.Authoritative, Is.True);
+                Assert.That(noName.Authority.Select(record => record.Type), Is.EqualTo(new[] { (UInt16) 6 }));
+                Assert.That(noData.ResponseCode,  Is.Zero, "NODATA is NOERROR with no answer");
+                Assert.That(noData.Answers,       Is.Empty);
+                Assert.That(noData.Authority.Select(record => record.Type), Is.EqualTo(new[] { (UInt16) 6 }));
+            });
+
+            // Above the zone the server is not authoritative: REFUSED, and not
+            // an NXDOMAIN that would deny the zone with it (RFC 8020).
+            var above      = await AskFor(first, "org", 1);
+
+            Assert.That(above.ResponseCode, Is.EqualTo(5), "REFUSED");
+
+            // A change of a record of the zone is a change of the zone.
+            await AtTheConsole(first, "txtRecords add example.org \"v=spf1 -all\"");
+
+            var counted    = first.Records.Zones[0].Serial;
+
+            Assert.That(counted, Is.EqualTo(serial + 1));
+
+            // ... and one in no zone is none.
+            await AtTheConsole(first, "aRecords add host.example.net 192.0.2.20");
+
+            Assert.That(first.Records.Zones[0].Serial, Is.EqualTo(counted));
+
+            var listed     = String.Join("\n", await AtTheConsole(first, "zones"));
+
+            Assert.Multiple(() => {
+                Assert.That(listed, Does.StartWith("1 zone(s):"));
+                Assert.That(listed, Does.Contain($"example.org.  serial {counted}, hostmaster hostmaster@example.org"));
+                Assert.That(listed, Does.Contain("IN SOA ns.example.org. hostmaster.example.org."));
+                Assert.That(listed, Does.Contain("IN NS ns.example.org."));
+            });
+
+            var second     = await Restarted(first, directory);
+
+            var soaAgain   = await AskFor(second, "example.org", 6);
+            var www        = await Ask   (second, "www.example.org");
+            var host       = await Ask   (second, "host.example.net");
+
+            Assert.Multiple(() => {
+                Assert.That(second.Records.Zones.Select(zone => zone.Serial), Is.EqualTo(new[] { counted }));
+                Assert.That(soaAgain.Answers[0].Data, Does.Contain($" {counted} "));
+                Assert.That(www. Addresses, Is.EqualTo(new[] { "192.0.2.10" }));
+                Assert.That(host.Addresses, Is.EqualTo(new[] { "192.0.2.20" }));
+            });
+
+            var zones      = JObject.Parse(File.ReadAllText(ConfigFileIn(directory)))[DNSServerSettings.SectionName]?["zones"] as JArray;
+
+            Assert.Multiple(() => {
+                Assert.That(zones,                     Has.Count.EqualTo(1));
+                Assert.That(zones![0]["name"]?.ToString(),   Is.EqualTo("example.org."));
+                Assert.That(zones [0]["serial"]?.Value<UInt32>(), Is.EqualTo(counted));
+                Assert.That(zones [0]["nameServers"]?.Values<String>(), Is.EqualTo(new[] { "ns.example.org." }));
+            });
+
+            var removed    = await AtTheConsole(second, "zones remove example.org.");
+
+            Assert.That(removed[0], Does.Contain("no longer authoritative for example.org."));
+
+            // Its records stay, and are answered by their name, as before.
+            var wwwAfter   = await Ask   (second, "www.example.org");
+            var soaAfter   = await AskFor(second, "example.org", 6);
+
+            Assert.Multiple(() => {
+                Assert.That(wwwAfter.Addresses, Is.EqualTo(new[] { "192.0.2.10" }));
+                Assert.That(soaAfter.Answers,   Is.Empty);
+                Assert.That(second.Records.Zones, Is.Empty);
+            });
+
+        }
+
+        #endregion
+
+        #region Zones_WithinEachOther_CountTheirOwnSerials()
+
+        [Test]
+        public async Task Zones_WithinEachOther_CountTheirOwnSerials()
+        {
+
+            var node   = await Started(NewDirectory());
+
+            await AtTheConsole(node, "zones add example.org ns1.example.net ns2.example.net");
+            await AtTheConsole(node, "zones add lab.example.org");
+
+            var parent = node.Records.Zones[0].Serial;
+            var child  = node.Records.Zones[1].Serial;
+
+            await AtTheConsole(node, "aRecords add www.lab.example.org 192.0.2.30");
+
+            var ns        = await AskFor   (node, "example.org",          2);
+            var soa       = await AskFor   (node, "example.org",          6);
+            var labSOA    = await AskFor   (node, "lab.example.org",      6);
+            var www       = await Ask      (node, "www.lab.example.org");
+            var noName    = await AskForAll(node, "nope.lab.example.org", 1);
+
+            Assert.Multiple(() => {
+
+                Assert.That(node.Records.Zones[0].Serial, Is.EqualTo(parent));
+                Assert.That(node.Records.Zones[1].Serial, Is.EqualTo(child + 1));
+
+                // The name servers of the one, outside of it, in both of its
+                // NS records - the first the primary of its SOA.
+                Assert.That(ns.Answers.Select(answer => answer.Data).Order(), Is.EqualTo(new[] { "ns1.example.net.", "ns2.example.net." }));
+                Assert.That(soa.Answers[0].Data, Does.StartWith("ns1.example.net. hostmaster.example.org. "));
+
+                // The other's, and its records, from it.
+                Assert.That(labSOA.Answers[0].Data, Does.StartWith("ns.lab.example.org. hostmaster.lab.example.org. "));
+                Assert.That(www.Addresses, Is.EqualTo(new[] { "192.0.2.30" }));
+                Assert.That(noName.ResponseCode, Is.EqualTo(3));
+                Assert.That(noName.Authority[0].Data, Does.StartWith("ns.lab.example.org. "));
+
+            });
+
+        }
+
+        #endregion
+
+        #region Zones_RefuseWhatCannotBe()
+
+        [Test]
+        public async Task Zones_RefuseWhatCannotBe()
+        {
+
+            var node          = await Started(NewDirectory());
+
+            await AtTheConsole(node, "cnameRecords add example.com www.example.org");
+
+            var anAlias       = await AtTheConsole(node, "zones add example.com");
+            var theRoot       = await AtTheConsole(node, "zones add .");
+            var aWildcard     = await AtTheConsole(node, "zones add *.example.org");
+            var twice         = await AtTheConsole(node, "zones add example.net ns1.example.net NS1.example.net.");
+            var noAddress     = await AtTheConsole(node, "zones add example.net");
+            var again         = await AtTheConsole(node, "zones add EXAMPLE.net.");
+            var cnameAtApex   = await AtTheConsole(node, "cnameRecords add example.net www.example.org");
+            var notThere      = await AtTheConsole(node, "zones remove example.info");
+            var tooFew        = await AtTheConsole(node, "zones add");
+
+            Assert.Multiple(() => {
+                Assert.That(anAlias    [0], Does.Contain("example.com. is an alias of www.example.org.").And.Contain("Remove it first."));
+                Assert.That(theRoot    [0], Does.Contain("the root is none"));
+                Assert.That(aWildcard  [0], Does.Contain("no wildcard"));
+                Assert.That(twice      [0], Does.Contain("NS1.example.net. is given twice"));
+                Assert.That(noAddress  [0], Does.Contain("authoritative for example.net. from now on"));
+                Assert.That(noAddress  [1], Does.StartWith("ns.example.net. has no address yet").And.Contain("aRecords add ns.example.net. <IPv4>"));
+                Assert.That(again      [0], Does.Contain("authoritative for example.net. already"));
+                Assert.That(cnameAtApex[0], Does.Contain("is the name of the zone example.net.").And.Contain("no other record"));
+                Assert.That(notThere   [0], Does.Contain("not authoritative for example.info.: nothing was removed"));
+                Assert.That(tooFew     [0], Does.StartWith("zones add <zone> [<nameServer> ...]"));
+            });
+
+            Assert.That(node.Records.Zones.Select(zone => zone.Name.FullName), Is.EqualTo(new[] { "example.net." }));
+
+            // Once it has an address, there is nothing left to say.
+            await AtTheConsole(node, "aRecords add ns.example.net 192.0.2.53");
+
+            var listed        = await AtTheConsole(node, "zones example.net");
+
+            Assert.That(String.Join("\n", listed), Does.Not.Contain("no address"));
+
+        }
+
+        #endregion
+
+        #region AZoneBesideItsOwnSOA_IsNoStart()
+
+        [Test]
+        public void AZoneBesideItsOwnSOA_IsNoStart()
+        {
+
+            var directory = NewDirectory();
+
+            File.WriteAllText(ConfigFileIn(directory),
+                              new JObject(new JProperty(DNSServerSettings.SectionName, new JObject(
+                                  new JProperty("records", new JArray("example.org. 3600 IN SOA ns.example.org. hostmaster.example.org. 1 2 3 4 5")),
+                                  new JProperty("zones",   new JArray(new JObject(new JProperty("name", "example.org"))))
+                              ))).ToString());
+
+            var problem = Assert.Throws<InvalidOperationException>(() => new DNSServerNode(
+                              HTTPPort:          TestPorts.Free(),
+                              AccountsPath:      Path.Combine(directory, "accounts"),
+                              ConfigFile:        new WWCPConfigFile(ConfigFileIn(directory)),
+                              CertificatesPath:  Path.Combine(directory, "certificates"),
+                              LogToConsole:      false,
+                              BridgeDebugLog:    false
+                          ));
+
+            Assert.That(problem!.Message, Does.Contain("the zone makes its SOA and NS records itself").And.Contain("Take 'example.org. 3600 IN SOA"));
 
         }
 
