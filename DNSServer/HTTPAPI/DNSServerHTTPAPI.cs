@@ -41,8 +41,8 @@ namespace cloud.charging.open.DNSServer
     ///   <item>GET  /api/v1/dnsServer                  - how the name server stands: where it listens, how many records it answers with, and how much it answered.</item>
     ///   <item>GET  /api/v1/dnsServer/settings         - the "dnsServer" section as it is in effect, the switches of this start included.</item>
     ///   <item>GET  /api/v1/dnsServer/records                 - every record: its name, type, class, TTL, data and value, and its zone-file line.</item>
-    ///   <item>POST /api/v1/dnsServer/records/{type}          - { "name", "address" | "text" | "target", "ttl"? }: the name answers with the record as well - answered with { "said", "note", "records" }.</item>
-    ///   <item>POST /api/v1/dnsServer/records/{type}/remove   - { "name", "address" | "text" | "target"? }: the name no longer answers with the record, or with any of the type - answered with { "said", "records" }.</item>
+    ///   <item>ADD    /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target", "ttl"? }: the name answers with the record as well - answered with { "said", "note", "records" }.</item>
+    ///   <item>REMOVE /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target"? }: the name no longer answers with the record, or with any of the type - answered with { "said", "records" }.</item>
     /// </list>
     /// {type} is a, aaaa, txt or cname; A and AAAA records carry an "address",
     /// TXT records a "text", taken as it is, and a CNAME the "target" it is an
@@ -52,6 +52,20 @@ namespace cloud.charging.open.DNSServer
     /// </remarks>
     public class DNSServerHTTPAPI : NodeHTTPAPI
     {
+
+        #region Data
+
+        /// <summary>
+        /// REMOVE a record from a resource: the counterpart of ADD, which Hermod
+        /// knows already. Registered once, as Hermod has every method that code
+        /// declares itself - a method that arrives over the wire is matched by
+        /// its name.
+        /// </summary>
+        public static readonly HTTPMethod REMOVE = HTTPMethod.Register("REMOVE",
+                                                                       IsIdempotent:  true,
+                                                                       Description:   "REMOVE a value from a resource");
+
+        #endregion
 
         #region Properties
 
@@ -91,15 +105,15 @@ namespace cloud.charging.open.DNSServer
             AddHandler(root + "/settings",           GetSettings,   HTTPMethod.GET);
             AddHandler(root + "/records",            GetRecords,    HTTPMethod.GET);
 
-            // records/a, records/aaaa, records/txt, records/cname - and the
-            // remove of each.
+            // records/a, records/aaaa, records/txt, records/cname: ADD a
+            // record, REMOVE one or every one of a name.
             foreach (var type in ResourceRecords.Changeable)
             {
 
                 var path = root + $"/records/{ADNSResourceRecord.TypeName(type).ToLowerInvariant()}";
 
-                AddHandler(path,               request => PostAdd   (type, request),  HTTPMethod.POST);
-                AddHandler(path + "/remove",   request => PostRemove(type, request),  HTTPMethod.POST);
+                AddHandler(path,  request => Add   (type, request),  HTTPMethod.ADD);
+                AddHandler(path,  request => Remove(type, request),  REMOVE);
 
             }
 
@@ -167,13 +181,13 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
-        #region (private) PostAdd   (Type, Request)
+        #region (private) Add   (Type, Request)
 
         /// <summary>
         /// One record of the given type more, as the command line's "... add".
         /// </summary>
-        private Task<HTTPResponse> PostAdd(DNSResourceRecordTypes  Type,
-                                           HTTPRequest             Request)
+        private Task<HTTPResponse> Add(DNSResourceRecordTypes  Type,
+                                       HTTPRequest             Request)
         {
 
             if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))
@@ -205,14 +219,14 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
-        #region (private) PostRemove(Type, Request)
+        #region (private) Remove(Type, Request)
 
         /// <summary>
         /// One record of the given type, or every one of a name, taken away, as
         /// the command line's "... remove".
         /// </summary>
-        private Task<HTTPResponse> PostRemove(DNSResourceRecordTypes  Type,
-                                              HTTPRequest             Request)
+        private Task<HTTPResponse> Remove(DNSResourceRecordTypes  Type,
+                                          HTTPRequest             Request)
         {
 
             if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))

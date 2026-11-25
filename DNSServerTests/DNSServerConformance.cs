@@ -46,6 +46,12 @@ namespace cloud.charging.open.DNSServer.Tests
     public class DNSServerConformance : NodeConformanceTests
     {
 
+        /// <summary>
+        /// The methods the records are changed with: ADD a record, REMOVE one.
+        /// </summary>
+        private static readonly HttpMethod ADD     = new ("ADD");
+        private static readonly HttpMethod REMOVE  = new ("REMOVE");
+
         protected override WWCPNode NewNode(String   Directory,
                                             JObject  Configuration)
             => Make(Directory, Configuration, null);
@@ -85,9 +91,10 @@ namespace cloud.charging.open.DNSServer.Tests
         #region TheRecordsAreChangedOverTheJSONAPI()
 
         /// <summary>
-        /// An A record added and removed by whoever may edit the name server:
-        /// answered with what was said and the records as they are now - and
-        /// what is no address refused, and nothing to remove said so.
+        /// An A record added with ADD and removed with REMOVE by whoever may edit
+        /// the name server: answered with what was said and the records as they
+        /// are now - and what is no address refused, nothing to remove said so,
+        /// and a POST, which changed the records before, changing nothing.
         /// </summary>
         [Test]
         public async Task TheRecordsAreChangedOverTheJSONAPI()
@@ -95,7 +102,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             using var http          = await SignedIn();
 
-            var (added, answer)     = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+            var (added, answer)     = await Send(http, ADD,    "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org"),
                                                              new JProperty("address",  "192.0.2.10"),
                                                              new JProperty("ttl",      "10m")));
@@ -117,13 +124,13 @@ namespace cloud.charging.open.DNSServer.Tests
             Assert.That(status["serving"]!.Value<Boolean>(),           Is.True);
             Assert.That(status["recordTypes"]!["A"]!.Value<Int32>(),   Is.EqualTo(1));
 
-            var (refused, why)      = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+            var (refused, why)      = await Send(http, ADD,    "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org"),
                                                              new JProperty("address",  "not-an-address")));
 
             Assert.That(refused,                                       Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
 
-            var (removed, after)    = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a/remove",
+            var (removed, after)    = await Send(http, REMOVE, "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org."),
                                                              new JProperty("address",  "192.0.2.10")));
 
@@ -131,10 +138,18 @@ namespace cloud.charging.open.DNSServer.Tests
             Assert.That(after["records"]!.Count(),                     Is.Zero);
             Assert.That(((DNSServerNode) Node).Records.Count,          Is.Zero);
 
-            var (nothing, said)     = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a/remove",
+            var (nothing, said)     = await Send(http, REMOVE, "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org")));
 
             Assert.That(nothing,                                       Is.EqualTo(HttpStatusCode.NotFound), said.ToString());
+
+            // ADD and REMOVE, not POST: what changes the records is said by its method.
+            var (posted, _)         = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+                                                 new JObject(new JProperty("name",     "www.example.org"),
+                                                             new JProperty("address",  "192.0.2.10")));
+
+            Assert.That(posted,                                        Is.Not.EqualTo(HttpStatusCode.OK));
+            Assert.That(((DNSServerNode) Node).Records.Count,          Is.Zero);
 
         }
 
@@ -156,16 +171,16 @@ namespace cloud.charging.open.DNSServer.Tests
 
             var text                = " v=spf1 \"quoted\" -all";
 
-            var (aaaa, aaaaAnswer)  = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/aaaa",
+            var (aaaa, aaaaAnswer)  = await Send(http, ADD,    "api/v1/dnsServer/records/aaaa",
                                                  new JObject(new JProperty("name",     "www.example.org"),
                                                              new JProperty("address",  "2001:db8::10")));
 
-            var (txt,  txtAnswer)   = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/txt",
+            var (txt,  txtAnswer)   = await Send(http, ADD,    "api/v1/dnsServer/records/txt",
                                                  new JObject(new JProperty("name",     "example.org"),
                                                              new JProperty("text",     text),
                                                              new JProperty("ttl",      300)));
 
-            var (cname, cnameAnswer) = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/cname",
+            var (cname, cnameAnswer) = await Send(http, ADD,    "api/v1/dnsServer/records/cname",
                                                  new JObject(new JProperty("name",     "docs.example.org"),
                                                              new JProperty("target",   "www.example.org")));
 
@@ -187,14 +202,14 @@ namespace cloud.charging.open.DNSServer.Tests
                 Assert.That(byType["CNAME"]["value"]!.Value<String>(),        Is.EqualTo("www.example.org."));
             });
 
-            var (beside, why)       = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+            var (beside, why)       = await Send(http, ADD,    "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "docs.example.org"),
                                                              new JProperty("address",  "192.0.2.10")));
 
             Assert.That(beside,                                        Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
             Assert.That(why.ToString(),                                Does.Contain("alias"));
 
-            var (noKey, missing)    = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/txt",
+            var (noKey, missing)    = await Send(http, ADD,    "api/v1/dnsServer/records/txt",
                                                  new JObject(new JProperty("name",     "example.org"),
                                                              new JProperty("address",  "192.0.2.10")));
 
@@ -208,7 +223,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
                 var name            = byType[type.ToUpperInvariant()]["name"]!.Value<String>()!;
 
-                var (removed, after) = await Send(http, HttpMethod.Post, $"api/v1/dnsServer/records/{type}/remove",
+                var (removed, after) = await Send(http, REMOVE, $"api/v1/dnsServer/records/{type}",
                                                   new JObject(new JProperty("name",  name),
                                                               new JProperty(key,     value)));
 
@@ -238,7 +253,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             Assert.That(records.Count(),                               Is.Zero);
 
-            var (status, answer)    = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+            var (status, answer)    = await Send(http, ADD,    "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org"),
                                                              new JProperty("address",  "192.0.2.10")));
 
@@ -261,7 +276,7 @@ namespace cloud.charging.open.DNSServer.Tests
 
             using var http          = await SignedInAs("hostmaster1", password);
 
-            var (status, answer)    = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+            var (status, answer)    = await Send(http, ADD,    "api/v1/dnsServer/records/a",
                                                  new JObject(new JProperty("name",     "www.example.org"),
                                                              new JProperty("address",  "192.0.2.10")));
 

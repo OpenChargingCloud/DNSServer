@@ -46,7 +46,7 @@ function dnsServer({ method, path, body }: Asked): unknown {
 
     const added = /^\/dnsServer\/records\/(a|aaaa|txt|cname)$/.exec(path);
 
-    if (method === 'POST' && added !== null) {
+    if (method === 'ADD' && added !== null) {
 
         const kind  = added[1]!;
         const sent  = body as Record<string, string>;
@@ -63,9 +63,9 @@ function dnsServer({ method, path, body }: Asked): unknown {
 
     }
 
-    const removed = /^\/dnsServer\/records\/(a|aaaa|txt|cname)\/remove$/.exec(path);
+    const removed = /^\/dnsServer\/records\/(a|aaaa|txt|cname)$/.exec(path);
 
-    if (method === 'POST' && removed !== null) {
+    if (method === 'REMOVE' && removed !== null) {
 
         const kind  = removed[1]!.toUpperCase();
         const sent  = body as Record<string, string>;
@@ -81,8 +81,9 @@ function dnsServer({ method, path, body }: Asked): unknown {
 
 }
 
-function posts(): { path: string; body: unknown }[] {
-    return asked.filter(one => one.method === 'POST').map(one => ({ path: one.path, body: one.body }));
+/** What was sent to change the records: ADD and REMOVE, each with its path and body. */
+function sent(): { method: string; path: string; body: unknown }[] {
+    return asked.filter(one => one.method !== 'GET').map(one => ({ method: one.method, path: one.path, body: one.body }));
 }
 
 const mayEdit = [ 'nameserver:read', 'nameserver:edit' ];
@@ -103,7 +104,7 @@ describe('the records', () => {
 
         await until(() => root.querySelector('tr[data-record^="www.example.org."]') !== null, 'the record was not drawn');
 
-        assert.deepEqual(posts(), [ { path: '/dnsServer/records/a', body: { name: 'www.example.org', address: '192.0.2.10' } } ]);
+        assert.deepEqual(sent(), [ { method: 'ADD', path: '/dnsServer/records/a', body: { name: 'www.example.org', address: '192.0.2.10' } } ]);
         assert.match(root.querySelector('#add-record-note')!.textContent!, /www\.example\.org\. answers with 192\.0\.2\.10 from now on\. Saved, and in effect\./);
         assert.equal(field(root, '#add-record', 'name').value, '', 'the form kept what was sent');
         assert.match(root.querySelector('tr[data-record^="www.example.org."]')!.textContent!, /A\s+3600 s\s+192\.0\.2\.10/);
@@ -122,9 +123,9 @@ describe('the records', () => {
         type(field(root, '#add-record', 'ttl'),  '10m');
         submit(root, '#add-record');
 
-        await until(() => posts().length === 1, 'nothing was sent');
+        await until(() => sent().length === 1, 'nothing was sent');
 
-        assert.deepEqual(posts()[0]!.body, { name: 'api.example.org.', address: '192.0.2.20', ttl: '10m' });
+        assert.deepEqual(sent()[0]!.body, { name: 'api.example.org.', address: '192.0.2.20', ttl: '10m' });
 
     });
 
@@ -147,9 +148,9 @@ describe('the records', () => {
         type(field(root, '#add-record', 'data'), ' v=spf1 "quoted" -all ');
         submit(root, '#add-record');
 
-        await until(() => posts().length === 1, 'nothing was sent');
+        await until(() => sent().length === 1, 'nothing was sent');
 
-        assert.deepEqual(posts()[0], { path: '/dnsServer/records/txt', body: { name: 'example.org', text: ' v=spf1 "quoted" -all ' } });
+        assert.deepEqual(sent()[0], { method: 'ADD', path: '/dnsServer/records/txt', body: { name: 'example.org', text: ' v=spf1 "quoted" -all ' } });
 
         await until(() => root.querySelector('tr[data-record^="example.org."]') !== null, 'the record was not drawn');
 
@@ -172,9 +173,9 @@ describe('the records', () => {
         type(field(root, '#add-record', 'data'), ' www.example.org ');
         submit(root, '#add-record');
 
-        await until(() => posts().length === 1, 'nothing was sent');
+        await until(() => sent().length === 1, 'nothing was sent');
 
-        assert.deepEqual(posts()[0], { path: '/dnsServer/records/cname', body: { name: 'docs.example.org', target: 'www.example.org' } });
+        assert.deepEqual(sent()[0], { method: 'ADD', path: '/dnsServer/records/cname', body: { name: 'docs.example.org', target: 'www.example.org' } });
 
     });
 
@@ -214,7 +215,7 @@ describe('the records', () => {
         await until(() => root.querySelectorAll('tr[data-record]').length === 3, 'the record was not removed');
 
         assert.ok(said.some(text => /Remove host\.example\.org\. A 192\.0\.2\.1\?/.test(text)), 'nobody was asked before it went');
-        assert.deepEqual(posts(), [ { path: '/dnsServer/records/a/remove', body: { name: 'host.example.org.', address: '192.0.2.1' } } ]);
+        assert.deepEqual(sent(), [ { method: 'REMOVE', path: '/dnsServer/records/a', body: { name: 'host.example.org.', address: '192.0.2.1' } } ]);
         assert.match(root.querySelector('#records-note')!.textContent!, /no longer answers with 192\.0\.2\.1/);
 
     });
@@ -233,7 +234,7 @@ describe('the records', () => {
 
         await until(() => root.querySelectorAll('tr[data-record]').length === 1, 'the record was not removed');
 
-        assert.deepEqual(posts(), [ { path: '/dnsServer/records/txt/remove', body: { name: 'example.org.', text: 'v=spf1 "quoted" -all' } } ]);
+        assert.deepEqual(sent(), [ { method: 'REMOVE', path: '/dnsServer/records/txt', body: { name: 'example.org.', text: 'v=spf1 "quoted" -all' } } ]);
 
     });
 

@@ -122,7 +122,7 @@ export function keyOf(Type: ChangeableType): 'address' | 'text' | 'target' {
     return Type === 'TXT' ? 'text' : Type === 'CNAME' ? 'target' : 'address';
 }
 
-/** A new record: POST /dnsServer/records/{type} - { name, address | text | target, ttl? }. */
+/** A new record: ADD /dnsServer/records/{type} - { name, address | text | target, ttl? }. */
 export interface NewRecord {
     name:      string;
     address?:  string;
@@ -132,7 +132,7 @@ export interface NewRecord {
     ttl?:      string;
 }
 
-/** Records taken away: POST /dnsServer/records/{type}/remove - every one of the name and type, where nothing else is given. */
+/** Records taken away: REMOVE /dnsServer/records/{type} - every one of the name and type, where nothing else is given. */
 export interface RemovedRecord {
     name:      string;
     address?:  string;
@@ -158,8 +158,8 @@ export const api = {
         status:    ()                       => request<NameServerStatus>   ('GET',  '/dnsServer'),
         settings:  ()                       => request<NameServerSettings> ('GET',  '/dnsServer/settings'),
         records:   ()                       => request<ResourceRecord[]>   ('GET',  '/dnsServer/records'),
-        add:       (type: ChangeableType, record: NewRecord)      => request<RecordsChanged>  ('POST', `/dnsServer/records/${type.toLowerCase()}`, record),
-        remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('POST', `/dnsServer/records/${type.toLowerCase()}/remove`, record)
+        add:       (type: ChangeableType, record: NewRecord)      => request<RecordsChanged>  ('ADD',    `/dnsServer/records/${type.toLowerCase()}`, record),
+        remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('REMOVE', `/dnsServer/records/${type.toLowerCase()}`, record)
     }
 
 };

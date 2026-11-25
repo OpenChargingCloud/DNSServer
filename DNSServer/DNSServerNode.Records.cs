@@ -90,7 +90,7 @@ namespace cloud.charging.open.DNSServer
         /// The given name answers with a record of the given type as well, from
         /// now on - as the command line's "aRecords add", "aaaaRecords add",
         /// "txtRecords add" and "cnameRecords add" and the JSON API's
-        /// POST v1/dnsServer/records/{type} say it.
+        /// ADD v1/dnsServer/records/{type} say it.
         /// </summary>
         /// <param name="Type">A, AAAA, TXT or CNAME.</param>
         /// <param name="Name">The name, complete; a trailing dot is optional.</param>
@@ -139,7 +139,7 @@ namespace cloud.charging.open.DNSServer
         /// The given name no longer answers with the given record of the given
         /// type - with any of the type, where no data is given - as the command
         /// line's "... remove" and the JSON API's
-        /// POST v1/dnsServer/records/{type}/remove say it.
+        /// REMOVE v1/dnsServer/records/{type} say it.
         /// </summary>
         /// <param name="Type">A, AAAA, TXT or CNAME.</param>
         /// <param name="Name">The name, complete; a trailing dot is optional.</param>
