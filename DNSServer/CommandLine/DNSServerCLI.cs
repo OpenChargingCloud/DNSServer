@@ -40,7 +40,7 @@ namespace cloud.charging.open.DNSServer.CommandLine
     /// walked for anything that implements ICLICommand and can be built from a
     /// DNSServerCLI: a command of the name server's own is a new file and
     /// nothing else - 'dnsServer', 'records', 'aRecords', 'aaaaRecords',
-    /// 'txtRecords', 'cnameRecords' and 'zones' among them.
+    /// 'txtRecords', 'cnameRecords', 'zones' and 'dnsClients' among them.
     /// </para>
     /// <para>
     /// Here, beside the name server, and not in the program that runs it: what

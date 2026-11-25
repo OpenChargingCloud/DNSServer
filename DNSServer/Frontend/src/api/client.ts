@@ -20,10 +20,10 @@ export * from '@node/api/client';
 
 /**
  * What a role may be allowed to touch on this DNS server: what every node
- * has, and the name server - read, how it stands and its records; edited,
- * its records.
+ * has, the name server - read, how it stands, its records, zones and DNS
+ * clients; edited, the same - and "dnsquery", run: asking over SSH.
  */
-export type Resource = NodeResource | 'nameserver';
+export type Resource = NodeResource | 'nameserver' | 'dnsquery';
 
 /** What somebody signed in to this DNS server may do: an operation on a resource, written "nameserver:edit". */
 export type Permission = `${Resource}:${Operation}`;
@@ -74,6 +74,8 @@ export interface NameServerStatus {
     zones:             string[];
     requestsReceived:  number;
     responsesSent:     number;
+    /** DNS over SSH: whether it is switched on and served, where, and how many DNS clients there are. */
+    ssh:               { enabled: boolean; served: boolean; subsystem: string; url: string | null; hostKey: string | null; clients: number };
 }
 
 /** The "dnsServer" section as it is in effect - the switches of this start included. */
@@ -88,6 +90,8 @@ export interface NameServerSettings {
     records:     string[];
     /** The zones it is authoritative for. */
     zones:       Zone[];
+    /** Whether DNS is answered over SSH, and to which machines besides the accounts. */
+    ssh:         { enabled: boolean; clients: DNSClientEntry[] };
 }
 
 /** One record the name server answers with. */
@@ -196,6 +200,75 @@ export interface ZonesChanged {
 }
 
 
+/** What one login - a DNS client, or an account that may run "dnsquery" - asked over SSH since the program started. */
+export interface SSHActivity {
+    queries:       number;
+    /** When it asked last, or null. */
+    lastAt:        string | null;
+    /** Where it asked from last: "192.0.2.7:51234". */
+    lastFrom:      string | null;
+    /** What it asked last: "www.example.org. A". */
+    lastQuestion:  string | null;
+}
+
+/** An account of the node that asked over SSH under its own name. */
+export interface SSHAccount {
+    name:      string;
+    activity:  SSHActivity;
+}
+
+/** One key of a DNS client: the authorized_keys line it was given as, and what it is. */
+export interface DNSClientKey {
+    line:          string;
+    algorithm?:    string;
+    /** "SHA256:...", as ssh-keygen -l says it. */
+    fingerprint?:  string;
+    comment?:      string | null;
+    /** Until when it may sign in, where its line says so. */
+    notAfter?:     string | null;
+    options?:      string[];
+    /** Whether it is the key of an SSH CA, whose user certificates let the client in. */
+    certAuthority?:  boolean;
+    /** The names a certificate of the CA has to be made out to - null for the client's own name. */
+    principals?:     string[] | null;
+}
+
+/** One machine that may ask over SSH, under its name, with one of its keys. */
+export interface DNSClient {
+    name:      string;
+    enabled:   boolean;
+    keys:      DNSClientKey[];
+    activity:  SSHActivity;
+}
+
+/** DNS over SSH and the DNS clients: GET and PUT /dnsServer/ssh. */
+export interface DNSOverSSH {
+    enabled:    boolean;
+    /** Whether it is served now: switched on, and the node's SSH server runs. */
+    served:     boolean;
+    subsystem:  string;
+    url:        string | null;
+    /** The host key a client holds the server to. */
+    hostKey:    string | null;
+    clients:    DNSClient[];
+    /** The accounts of the node that asked over SSH. */
+    accounts:   SSHAccount[];
+}
+
+/** One DNS client as it is sent: its keys as authorized_keys lines. */
+export interface DNSClientEntry {
+    name:     string;
+    keys:     string[];
+    enabled:  boolean;
+}
+
+/** What a change of DNS over SSH sends: what it changes, and nothing else. */
+export interface SSHChange {
+    enabled?:  boolean;
+    clients?:  DNSClientEntry[];
+}
+
+
 /** How the DNS server is asked: the routes every node has, typed with the server's own of them, and the name server. */
 export const api = {
 
@@ -209,7 +282,9 @@ export const api = {
         remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('REMOVE', `/dnsServer/records/${type.toLowerCase()}`, record),
         zones:       ()                     => request<ListedZone[]>       ('GET',    '/dnsServer/zones'),
         addZone:     (zone: NewZone)        => request<ZonesChanged>       ('ADD',    '/dnsServer/zones', zone),
-        removeZone:  (name: string)         => request<ZonesChanged>       ('REMOVE', '/dnsServer/zones', { name })
+        removeZone:  (name: string)         => request<ZonesChanged>       ('REMOVE', '/dnsServer/zones', { name }),
+        ssh:         ()                     => request<DNSOverSSH>         ('GET',    '/dnsServer/ssh'),
+        setSSH:      (change: SSHChange)    => request<DNSOverSSH>         ('PUT',    '/dnsServer/ssh', change)
     }
 
 };

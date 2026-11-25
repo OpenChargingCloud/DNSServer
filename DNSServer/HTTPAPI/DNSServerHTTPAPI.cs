@@ -21,6 +21,7 @@ using System.Diagnostics.CodeAnalysis;
 
 using Newtonsoft.Json.Linq;
 
+using org.GraphDefined.Vanaheimr.Illias;
 using org.GraphDefined.Vanaheimr.Hermod.DNS;
 using org.GraphDefined.Vanaheimr.Hermod.HTTP;
 
@@ -46,6 +47,8 @@ namespace cloud.charging.open.DNSServer
     ///   <item>GET    /api/v1/dnsServer/zones                 - every zone the name server is authoritative for: its name, name servers, hostmaster, serial and timers, the SOA and NS records it makes, and a "note" on what it lacks.</item>
     ///   <item>ADD    /api/v1/dnsServer/zones                 - { "name", "nameServers"? }: the name server is authoritative for the zone from now on - answered with { "said", "note", "zones" }.</item>
     ///   <item>REMOVE /api/v1/dnsServer/zones                 - { "name" }: it no longer is; its records stay - answered with { "said", "zones" }.</item>
+    ///   <item>GET    /api/v1/dnsServer/ssh                   - DNS over SSH, the DNS clients with their keys, and what each login asked over SSH since the start.</item>
+    ///   <item>PUT    /api/v1/dnsServer/ssh                   - { "enabled"?, "clients"?: [ { "name", "keys", "enabled" } ] }: DNS over SSH, and who may ask there - answered as GET.</item>
     /// </list>
     /// {type} is a, aaaa, txt or cname; A and AAAA records carry an "address",
     /// TXT records a "text", taken as it is, and a CNAME the "target" it is an
@@ -110,6 +113,8 @@ namespace cloud.charging.open.DNSServer
             AddHandler(root + "/zones",              GetZones,      HTTPMethod.GET);
             AddHandler(root + "/zones",              AddZone,       HTTPMethod.ADD);
             AddHandler(root + "/zones",              RemoveZone,    REMOVE);
+            AddHandler(root + "/ssh",                GetSSH,        HTTPMethod.GET);
+            AddHandler(root + "/ssh",                PutSSH,        HTTPMethod.PUT);
 
             // records/a, records/aaaa, records/txt, records/cname: ADD a
             // record, REMOVE one or every one of a name.
@@ -243,6 +248,109 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+
+        #region (private) GetSSH(Request)
+
+        /// <summary>
+        /// DNS over SSH and the DNS clients, each key with its fingerprint: what
+        /// the DNS clients page shows.
+        /// </summary>
+        private Task<HTTPResponse> GetSSH(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Read(DNSServerAccess.NameServer), false, out _, out var refused))
+                return Task.FromResult(refused);
+
+            return Task.FromResult(JSONResponse(Request, HTTPStatusCode.OK, DNSServer.SSHJSON()));
+
+        }
+
+        #endregion
+
+        #region (private) PutSSH(Request)
+
+        /// <summary>
+        /// DNS over SSH switched on or off, and the DNS clients as a whole: what
+        /// the request leaves out stays as it is. Everything is read before
+        /// anything is changed.
+        /// </summary>
+        private Task<HTTPResponse> PutSSH(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))
+                return Task.FromResult(refused);
+
+            if (!TryParseJSONObject(Request, out var json, out var badRequest))
+                return Task.FromResult(badRequest);
+
+            Boolean? enabled = null;
+
+            if (json["enabled"] is JToken enabledToken && enabledToken.Type != JTokenType.Null)
+            {
+
+                if (enabledToken.Type != JTokenType.Boolean)
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "\"enabled\" is true or false."));
+
+                enabled = enabledToken.Value<Boolean>();
+
+            }
+
+            List<DNSClientEntry>? clients = null;
+
+            if (json["clients"] is JToken clientsToken && clientsToken.Type != JTokenType.Null)
+            {
+
+                if (clientsToken is not JArray clientsArray)
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "\"clients\" is a list of { \"name\", \"keys\", \"enabled\" }."));
+
+                clients = [];
+
+                foreach (var clientToken in clientsArray)
+                {
+
+                    if (!DNSServerSettings.TryParseClient(clientToken, out var client, out var error))
+                        return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error));
+
+                    if (clients.Any(known => String.Equals(known.Name, client.Name, StringComparison.OrdinalIgnoreCase)))
+                        return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, $"The DNS client '{client.Name}' is listed twice."));
+
+                    if (!DNSServer.SSHClients.Knows(User_Id.Parse(client.Name)) &&
+                        DNSServer.ExtAPI.TryGetUser(User_Id.Parse(client.Name), out _))
+                        return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest,
+                                                         $"'{client.Name}' is an account of this {DNSServer.Kind.Name} already, and a name that is both is let in as neither. Choose another name."));
+
+                    clients.Add(client);
+
+                }
+
+            }
+
+            if (enabled is Boolean on && on != DNSServer.Settings.SSHEnabled)
+            {
+
+                if (!DNSServer.TrySetSSHEnabled(on, out var notSaved))
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.InternalServerError, notSaved));
+
+                Log.Notice($"'{user.Id}' switched DNS over SSH {(on ? "on" : "off")}.", "dnsserver", "ssh");
+
+            }
+
+            if (clients is not null)
+            {
+
+                if (!DNSServer.TrySetSSHClients(clients, out var notSaved))
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.InternalServerError, notSaved));
+
+                Log.Notice($"'{user.Id}' set the DNS clients that may ask over SSH: {(clients.Count == 0 ? "none" : String.Join(", ", clients.Select(client => client.Name)))}.",
+                           "dnsserver", "ssh", "auth");
+
+            }
+
+            return Task.FromResult(JSONResponse(Request, HTTPStatusCode.OK, DNSServer.SSHJSON()));
+
+        }
+
+        #endregion
 
         #region (static) KeyOf(Type)
 

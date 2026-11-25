@@ -315,6 +315,88 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region TheDNSClientsAreChangedOverTheJSONAPI()
+
+        /// <summary>
+        /// The DNS clients set with PUT: each key shown with its fingerprint, the
+        /// whole of it written down, DNS over SSH switched off and on, and what
+        /// cannot be a DNS client refused with nothing changed.
+        /// </summary>
+        [Test]
+        public async Task TheDNSClientsAreChangedOverTheJSONAPI()
+        {
+
+            using var http          = await SignedIn();
+
+            var key                 = org.GraphDefined.Vanaheimr.Hermod.SSH.SshPublicKey.FromHostKey(
+                                          org.GraphDefined.Vanaheimr.Hermod.SSH.SshHostKey.GenerateEd25519(), "cs001").ToAuthorizedKeyLine();
+
+            var (put, answer)       = await Send(http, HttpMethod.Put, "api/v1/dnsServer/ssh",
+                                                 new JObject(new JProperty("clients", new JArray(
+                                                     new JObject(new JProperty("name", "cs001"),
+                                                                 new JProperty("keys", new JArray(key)))))));
+
+            Assert.That(put,                                           Is.EqualTo(HttpStatusCode.OK), answer.ToString());
+
+            var client              = answer["clients"]![0]!;
+
+            Assert.Multiple(() => {
+                Assert.That(answer["enabled"]!.Value<Boolean>(),       Is.True);
+                Assert.That(answer["subsystem"]!.Value<String>(),      Is.EqualTo("dns@open.charging.cloud"));
+                Assert.That(client["name"]!.Value<String>(),           Is.EqualTo("cs001"));
+                Assert.That(client["enabled"]!.Value<Boolean>(),       Is.True);
+                Assert.That(client["keys"]![0]!["algorithm"]!.Value<String>(),   Is.EqualTo("ssh-ed25519"));
+                Assert.That(client["keys"]![0]!["fingerprint"]!.Value<String>(), Does.StartWith("SHA256:"));
+                Assert.That(client["activity"]!["queries"]!.Value<Int64>(),      Is.Zero);
+            });
+
+            var (off, switchedOff)  = await Send(http, HttpMethod.Put, "api/v1/dnsServer/ssh",
+                                                 new JObject(new JProperty("enabled", false)));
+
+            Assert.That(off,                                           Is.EqualTo(HttpStatusCode.OK), switchedOff.ToString());
+            Assert.That(switchedOff["enabled"]!.Value<Boolean>(),      Is.False);
+            Assert.That(switchedOff["clients"]!.Count(),               Is.EqualTo(1), "what the request left out stays");
+
+            var settings            = await GetJSON(http, "api/v1/dnsServer/settings");
+
+            Assert.That(settings["ssh"]!["enabled"]!.Value<Boolean>(), Is.False);
+            Assert.That(settings["ssh"]!["clients"]![0]!["keys"]![0]!.Value<String>(), Is.EqualTo(key));
+
+            var (twice, why)        = await Send(http, HttpMethod.Put, "api/v1/dnsServer/ssh",
+                                                 new JObject(new JProperty("enabled", true),
+                                                             new JProperty("clients", new JArray(
+                                                                 new JObject(new JProperty("name", "cs002")),
+                                                                 new JObject(new JProperty("name", "CS002"))))));
+
+            var (badKey, notAKey)   = await Send(http, HttpMethod.Put, "api/v1/dnsServer/ssh",
+                                                 new JObject(new JProperty("clients", new JArray(
+                                                     new JObject(new JProperty("name", "cs003"),
+                                                                 new JProperty("keys", new JArray("no key at all")))))));
+
+            var (account, isOne)    = await Send(http, HttpMethod.Put, "api/v1/dnsServer/ssh",
+                                                 new JObject(new JProperty("clients", new JArray(
+                                                     new JObject(new JProperty("name", AdminLogin.ToString()))))));
+
+            Assert.Multiple(() => {
+                Assert.That(twice,                                     Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
+                Assert.That(why.ToString(),                            Does.Contain("listed twice"));
+                Assert.That(badKey,                                    Is.EqualTo(HttpStatusCode.BadRequest), notAKey.ToString());
+                Assert.That(notAKey.ToString(),                        Does.Contain("authorized_keys"));
+                Assert.That(account,                                   Is.EqualTo(HttpStatusCode.BadRequest), isOne.ToString());
+                Assert.That(isOne.ToString(),                          Does.Contain("is an account"));
+            });
+
+            var after               = await GetJSON(http, "api/v1/dnsServer/ssh");
+
+            Assert.Multiple(() => {
+                Assert.That(after["enabled"]!.Value<Boolean>(),        Is.False, "a refused request switched DNS over SSH on");
+                Assert.That(after["clients"]!.Select(entry => entry["name"]!.Value<String>()), Is.EqualTo(new[] { "cs001" }));
+            });
+
+        }
+
+        #endregion
+
         #region AnOperatorMayReadTheRecordsButNotChangeThem()
 
         [Test]

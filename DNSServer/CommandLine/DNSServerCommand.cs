@@ -82,6 +82,11 @@ namespace cloud.charging.open.DNSServer.CommandLine
                 $"zones           {(node.Records.Zones.Count > 0
                                         ? $"{String.Join(", ", node.Records.Zones.Select(zone => zone.Name.FullName))}; see '{ZonesCommand.CommandName}'"
                                         : $"none - '{ZonesCommand.CommandName} add <zone>' adds one, with its SOA and NS records")}",
+                $"over SSH        {(node.DNSOverSSH
+                                        ? $"{node.SSHURL}, subsystem {org.GraphDefined.Vanaheimr.Hermod.DNS.DNSServer.SSHSubsystemName}"
+                                        : node.Settings.SSHEnabled
+                                              ? "switched on, but the SSH server is off"
+                                              : "switched off")}; {node.Settings.SSHClients.Count} DNS client(s) - see '{DNSClientsCommand.CommandName}'",
                 $"default TTL     {(Int64) node.Settings.DefaultTTL.TotalSeconds} s",
                 $"answered        {node.ResponsesSent} response(s) to {node.RequestsReceived} request(s)"
             ];

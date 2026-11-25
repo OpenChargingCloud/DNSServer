@@ -20,9 +20,12 @@
 using IPAddress = System.Net.IPAddress;
 using IPEndPoint = System.Net.IPEndPoint;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 
 using Newtonsoft.Json.Linq;
 
+using org.GraphDefined.Vanaheimr.Illias;
 using org.GraphDefined.Vanaheimr.Hermod;
 using org.GraphDefined.Vanaheimr.Hermod.DNS;
 using org.GraphDefined.Vanaheimr.Hermod.HTTP;
@@ -36,6 +39,7 @@ using cloud.charging.open.protocols.WWCP.Node.Configuration;
 using cloud.charging.open.protocols.WWCP.Node.SecureShell;
 
 using cloud.charging.open.DNSServer.CommandLine;
+using cloud.charging.open.DNSServer.SecureShell;
 
 // Inside cloud.charging.open.DNSServer the bare name DNSServer is this
 // namespace, so Hermod's server goes by another one.
@@ -48,9 +52,9 @@ namespace cloud.charging.open.DNSServer
 
     /// <summary>
     /// One name server for a local network: a WWCP node that answers DNS over
-    /// UDP and TCP with the records it was given - in its web interface, at its
-    /// command line, over SSH, or in the "dnsServer" section of its
-    /// configuration file.
+    /// UDP and TCP - and over SSH, to the machines it lets in there - with the
+    /// records it was given in its web interface, at its command line, over
+    /// SSH, or in the "dnsServer" section of its configuration file.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -58,6 +62,15 @@ namespace cloud.charging.open.DNSServer
     /// with an authoritative request handler that looks up in the records (see
     /// <see cref="ResourceRecords"/>), which are written back to the
     /// configuration file whenever they change.
+    /// </para>
+    /// <para>
+    /// DNS over SSH is the subsystem "dns@open.charging.cloud" of the node's
+    /// SSH server, which carries DNS over TCP unchanged: a charging station
+    /// that runs OCPP over SSH resolves its names over the connection it has
+    /// anyway, against the host key it pins for OCPP. It is served to the DNS
+    /// clients of the section - machines that sign in with their own keys and
+    /// get nothing else - and to every account allowed to run "dnsquery" (see
+    /// <see cref="DNSClientSSHSignIns"/>).
     /// </para>
     /// <para>
     /// What every program of this family has - the sign-in, the name servers
@@ -119,8 +132,17 @@ namespace cloud.charging.open.DNSServer
         /// </summary>
         public const                String    HTTPRoot          = "cloud.charging.open.DNSServer.HTTPRoot.";
 
+        /// <summary>
+        /// What the log and the SSH page call DNS over SSH.
+        /// </summary>
+        public const                String    DNSOverSSHLabel   = "DNS";
+
         private Int64 requestsReceived;
         private Int64 responsesSent;
+
+        private Boolean dnsOverSSHServed;
+
+        private readonly ConcurrentDictionary<String, DNSClientActivity> sshActivity = new (StringComparer.Ordinal);
 
         #endregion
 
@@ -145,6 +167,25 @@ namespace cloud.charging.open.DNSServer
         /// Hermod's DNS server, which answers.
         /// </summary>
         public HermodDNSServer    Server       { get; }
+
+        /// <summary>
+        /// The machines that may ask over SSH.
+        /// </summary>
+        public DNSClientSSHSignIns  SSHClients  { get; }
+
+        /// <summary>
+        /// Whether DNS is answered over SSH now: switched on in the section, and
+        /// the node's SSH server running.
+        /// </summary>
+        public Boolean            DNSOverSSH
+            => dnsOverSSHServed && SSHEnabled;
+
+        /// <summary>
+        /// What each login asked over SSH since the start, by its name: the DNS
+        /// clients, and the accounts allowed to run "dnsquery".
+        /// </summary>
+        public IReadOnlyDictionary<String, DNSClientActivity>  SSHActivity
+            => sshActivity;
 
         /// <summary>
         /// Where DNS over UDP listens now, or null while it does not.
@@ -295,8 +336,17 @@ namespace cloud.charging.open.DNSServer
                           );
 
             this.Server.OnDNSRequestReceived += (timestamp, server, serverType, request, cancellationToken) => {
+
                 Interlocked.Increment(ref requestsReceived);
+
+                // Over SSH the server knows the client by its login.
+                if (serverType == HermodDNSServer.SSHServerType && request.ClientIdentity is String login)
+                    sshActivity.AddOrUpdate(login,
+                                            _         => DNSClientActivity.None.With(timestamp, request),
+                                            (_, seen) => seen.With(timestamp, request));
+
                 return Task.CompletedTask;
+
             };
 
             this.Server.OnDNSResponseSent    += (timestamp, server, serverType, response, cancellationToken) => {
@@ -319,6 +369,23 @@ namespace cloud.charging.open.DNSServer
 
             #endregion
 
+            #region DNS over SSH: the subsystem, and the machines let in for it
+
+            this.SSHClients = new DNSClientSSHSignIns(
+                                  Settings.SSHClients,
+                                  HermodDNSServer.SSHSubsystemName,
+                                  () => DNSOverSSH
+                              );
+
+            this.SSHClients.OnNotice += (level, message) => this.Log.Log(level, message, "dnsserver", "ssh", "auth");
+
+            AddSSHSignIns(SSHClients);
+
+            if (Settings.SSHEnabled)
+                ServeDNSOverSSH();
+
+            #endregion
+
             #region What somebody signed in over SSH gets
 
             // The DNS server's command line, with its commands beside the
@@ -332,6 +399,106 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+
+        #region (private) ServeDNSOverSSH() / StopServingDNSOverSSH()
+
+        /// <summary>
+        /// DNS on the node's SSH server, answered by the name server that
+        /// answers over UDP and TCP - with the same records and zones.
+        /// </summary>
+        private void ServeDNSOverSSH()
+        {
+
+            if (dnsOverSSHServed)
+                return;
+
+            AddSSHSubsystem(new SSHSubsystem(
+                                HermodDNSServer.SSHSubsystemName,
+                                DNSOverSSHLabel,
+                                Server.ServeSSHSubsystemAsync,
+                                Permission.Run(DNSServerAccess.Query)
+                            ));
+
+            dnsOverSSHServed = true;
+
+        }
+
+        private void StopServingDNSOverSSH()
+        {
+
+            if (!dnsOverSSHServed)
+                return;
+
+            dnsOverSSHServed = false;
+
+            RemoveSSHSubsystem(HermodDNSServer.SSHSubsystemName);
+
+        }
+
+        #endregion
+
+        #region TrySetSSHClients(Clients, out Error)
+
+        /// <summary>
+        /// The machines that may ask over SSH from now on - kept in the "ssh"
+        /// of the "dnsServer" section.
+        /// </summary>
+        public Boolean TrySetSSHClients(IEnumerable<DNSClientEntry>       Clients,
+                                        [NotNullWhen(false)] out String?  Error)
+        {
+
+            var clients = Clients.ToArray();
+
+            var updated = Settings with { SSHClients = clients };
+
+            if (!ConfigFile.TryMergeSection(DNSServerSettings.SectionName,
+                                            new JObject(new JProperty("ssh", updated.SSHToJSON())),
+                                            out Error))
+                return false;
+
+            Settings = updated;
+            SSHClients.Set(clients);
+
+            // Whoever is no longer let in is ended now rather than at the next check.
+            RecheckSSHSessions();
+
+            return true;
+
+        }
+
+        #endregion
+
+        #region TrySetSSHEnabled(Enabled, out Error)
+
+        /// <summary>
+        /// Answer DNS over SSH from now on, or not - kept in the "ssh" of the
+        /// "dnsServer" section.
+        /// </summary>
+        public Boolean TrySetSSHEnabled(Boolean                           Enabled,
+                                        [NotNullWhen(false)] out String?  Error)
+        {
+
+            var updated = Settings with { SSHEnabled = Enabled };
+
+            if (!ConfigFile.TryMergeSection(DNSServerSettings.SectionName,
+                                            new JObject(new JProperty("ssh", updated.SSHToJSON())),
+                                            out Error))
+                return false;
+
+            Settings = updated;
+
+            if (Enabled)
+                ServeDNSOverSSH();
+            else
+                StopServingDNSOverSSH();
+
+            Log.Notice($"DNS over SSH is switched {(Enabled ? "on" : "off")}.", "dnsserver", "ssh");
+
+            return true;
+
+        }
+
+        #endregion
 
         #region (private) WriteRecords(Lines, Zones)
 
@@ -464,6 +631,29 @@ namespace cloud.charging.open.DNSServer
                             : "."),
                        "dnsserver");
 
+            if (Settings.SSHEnabled)
+            {
+                if (SSHEnabled)
+                {
+
+                    Log.Notice($"DNS is answered over SSH as well: {SSHURL}, subsystem {HermodDNSServer.SSHSubsystemName}, host key {SSHHostKey ?? "not known yet"} " +
+                               $"({SSHClients.Clients.Count(client => client.Enabled && client.Keys.Count > 0)} DNS client(s) with a key, and every account allowed to run '{DNSServerAccess.Query}').",
+                               "dnsserver", "ssh");
+
+                    // The SSH server listens where the web interface does, and
+                    // that is the loopback address unless the start said --any.
+                    if (SSHURL is String sshURL &&
+                        (sshURL.Contains("127.0.0.1") || sshURL.Contains("[::1]") || sshURL.Contains("localhost")))
+                        Log.Notice("DNS over SSH reaches this machine only: the SSH server listens where the web interface does, on the loopback address. " +
+                                   "Start with --any to offer it in the network.",
+                                   "dnsserver", "ssh");
+
+                }
+                else
+                    Log.Warning("DNS over SSH is switched on, but the SSH server of this node is off - so nobody can reach it. Switch SSH on in the \"ssh\" section, or leave out --no-ssh.",
+                                "dnsserver", "ssh");
+            }
+
             return Task.CompletedTask;
 
         }
@@ -526,8 +716,92 @@ namespace cloud.charging.open.DNSServer
                                                                       OrderBy (group  => group.Key, StringComparer.Ordinal).
                                                                       Select  (group  => new JProperty(group.Key, group.Count())))),
                    new JProperty("requestsReceived",  RequestsReceived),
-                   new JProperty("responsesSent",     ResponsesSent)
+                   new JProperty("responsesSent",     ResponsesSent),
+                   new JProperty("ssh",               new JObject(
+                       new JProperty("enabled",           Settings.SSHEnabled),
+                       new JProperty("served",            DNSOverSSH),
+                       new JProperty("subsystem",         HermodDNSServer.SSHSubsystemName),
+                       new JProperty("url",               SSHURL),
+                       new JProperty("hostKey",           SSHHostKey),
+                       new JProperty("clients",           Settings.SSHClients.Count)
+                   ))
                );
+
+        #endregion
+
+        #region SSHJSON()
+
+        /// <summary>
+        /// DNS over SSH as the DNS clients page shows it: whether it is switched
+        /// on and served, where a client reaches it and what host key it holds
+        /// the server to - and the DNS clients, each key with what it is: its
+        /// algorithm, its fingerprint, its comment and its options, beside the
+        /// line it was given as, which is what is sent back; and each client
+        /// with what it asked over SSH since the start, as the accounts that
+        /// asked are.
+        /// </summary>
+        public JObject SSHJSON()
+
+            => new (
+                   new JProperty("enabled",    Settings.SSHEnabled),
+                   new JProperty("served",     DNSOverSSH),
+                   new JProperty("subsystem",  HermodDNSServer.SSHSubsystemName),
+                   new JProperty("url",        SSHURL),
+                   new JProperty("hostKey",    SSHHostKey),
+                   new JProperty("clients",    new JArray(Settings.SSHClients.Select(client => new JObject(
+                       new JProperty("name",       client.Name),
+                       new JProperty("enabled",    client.Enabled),
+                       new JProperty("keys",       new JArray(client.Keys.Select(KeyJSON))),
+                       new JProperty("activity",   ActivityOf(client.Name).ToJSON())
+                   )))),
+                   new JProperty("accounts",   new JArray(AccountsThatAsked().Select(account => new JObject(
+                       new JProperty("name",       account.Key),
+                       new JProperty("activity",   account.Value.ToJSON())
+                   ))))
+               );
+
+        /// <summary>
+        /// What the login of this name asked over SSH since the start.
+        /// </summary>
+        public DNSClientActivity ActivityOf(String Name)
+
+            => sshActivity.TryGetValue(Name, out var activity)
+                   ? activity
+                   : DNSClientActivity.None;
+
+        /// <summary>
+        /// The logins that asked over SSH but are no DNS client: accounts of the
+        /// node that may run "dnsquery", each with what it asked.
+        /// </summary>
+        public IEnumerable<KeyValuePair<String, DNSClientActivity>> AccountsThatAsked()
+
+            => sshActivity.
+                   Where  (activity => !(User_Id.TryParse(activity.Key) is User_Id client && SSHClients.Knows(client))).
+                   OrderBy(activity => activity.Key, StringComparer.OrdinalIgnoreCase);
+
+        private static JObject KeyJSON(String Line)
+        {
+
+            // Every line was parsed before it was taken in; one that does not
+            // parse now is said as it stands, with nothing made up about it.
+            if (!org.GraphDefined.Vanaheimr.Hermod.SSH.AuthorizedKeysFile.TryParseLine(Line, out var key) ||
+                key is null)
+            {
+                return new JObject(new JProperty("line", Line));
+            }
+
+            return new JObject(
+                       new JProperty("line",           Line),
+                       new JProperty("algorithm",      key.PublicKey.Algorithm),
+                       new JProperty("fingerprint",    key.PublicKey.Sha256Fingerprint),
+                       new JProperty("comment",        key.PublicKey.Comment.Length > 0 ? key.PublicKey.Comment : null),
+                       new JProperty("notAfter",       key.NotAfter?.ToString("o")),
+                       new JProperty("options",        new JArray(key.Options)),
+                       new JProperty("certAuthority",  key.IsCertAuthority),
+                       new JProperty("principals",     key.Principals.Count > 0 ? new JArray(key.Principals) : null)
+                   );
+
+        }
 
         #endregion
 

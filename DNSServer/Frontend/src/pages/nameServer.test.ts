@@ -14,7 +14,7 @@ const { nameServerPage, ttlWords } = await import('./nameServer.ts');
 
 let status: Record<string, unknown> = {};
 
-const settings = { listen: '127.0.0.1', port: 5353, udp: true, tcp: true, defaultTTL: 3600, records: [], zones: [] };
+const settings = { listen: '127.0.0.1', port: 5353, udp: true, tcp: true, defaultTTL: 3600, records: [], zones: [], ssh: { enabled: true, clients: [] } };
 
 function dnsServer({ path }: Asked): unknown {
 
@@ -35,7 +35,8 @@ describe('the name server', () => {
 
         status = { serving: true, listen: '127.0.0.1', udp: '127.0.0.1:5353', tcp: '127.0.0.1:5353',
                    records: 3, recordTypes: { A: 2, AAAA: 1 }, zones: [ 'example.org.', 'lab.example.org.' ],
-                   requestsReceived: 12, responsesSent: 11 };
+                   requestsReceived: 12, responsesSent: 11,
+                   ssh: { enabled: true, served: true, subsystem: 'dns@open.charging.cloud', url: 'ssh://127.0.0.1:22362', hostKey: 'SHA256:host', clients: 2 } };
 
         const root = await open(nameServerPage, '/dnsServer', [ 'nameserver:read' ],
                                 dnsServer, root => root.querySelector('#listeners') !== null);
@@ -46,6 +47,7 @@ describe('the name server', () => {
         assert.match(root.querySelector('#record-count')!.textContent!, /3 records: 2 A, 1 AAAA\./);
         assert.equal(root.querySelector('#default-ttl')!.textContent,   '3600 s (1 h)');
         assert.equal(root.querySelector('#zone-names')!.textContent,    'example.org., lab.example.org.');
+        assert.equal(root.querySelector('#over-ssh')!.textContent,      'ssh://127.0.0.1:22362, 2 DNS clients');
         assert.equal(root.querySelector('#requests')!.textContent,      '12');
         assert.equal(root.querySelector('#responses')!.textContent,     '11');
 
@@ -54,7 +56,8 @@ describe('the name server', () => {
     it('says so where it does not answer', async () => {
 
         status = { serving: false, listen: 'any', udp: null, tcp: null,
-                   records: 0, recordTypes: {}, zones: [], requestsReceived: 0, responsesSent: 0 };
+                   records: 0, recordTypes: {}, zones: [], requestsReceived: 0, responsesSent: 0,
+                   ssh: { enabled: true, served: false, subsystem: 'dns@open.charging.cloud', url: null, hostKey: null, clients: 0 } };
 
         const root = await open(nameServerPage, '/dnsServer', [ 'nameserver:read' ],
                                 dnsServer, root => root.querySelector('#listeners') !== null);
@@ -65,6 +68,7 @@ describe('the name server', () => {
         assert.equal(root.querySelector('#udp')!.textContent, 'not listening');
         assert.match(root.querySelector('#record-count')!.textContent!, /No record yet/);
         assert.match(root.querySelector('#zone-names')!.textContent!,   /^none/);
+        assert.equal(root.querySelector('#over-ssh')!.textContent,      'switched on, but the SSH server is off');
 
     });
 

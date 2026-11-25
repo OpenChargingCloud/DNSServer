@@ -30,6 +30,29 @@ namespace cloud.charging.open.DNSServer
 {
 
     /// <summary>
+    /// A machine that may ask the name server over SSH: its login name and the
+    /// authorized_keys lines it signs in with.
+    /// </summary>
+    /// <param name="Name">The login name it signs in with.</param>
+    /// <param name="Keys">Its keys, each as an authorized_keys line - options such as from="10.0.0.0/8" in front of it hold as OpenSSH holds them, and with cert-authority it is the key of an SSH CA.</param>
+    /// <param name="Enabled">Whether it is let in at all.</param>
+    public sealed record DNSClientEntry(String                 Name,
+                                        IReadOnlyList<String>  Keys,
+                                        Boolean                Enabled = true)
+    {
+
+        public JObject ToJSON()
+
+            => new (
+                   new JProperty("name",     Name),
+                   new JProperty("keys",     new JArray(Keys)),
+                   new JProperty("enabled",  Enabled)
+               );
+
+    }
+
+
+    /// <summary>
     /// What the "dnsServer" section of the configuration file says: where the
     /// name server listens, over which transports, and the resource records it
     /// answers with.
@@ -43,7 +66,9 @@ namespace cloud.charging.open.DNSServer
     ///     "tcp":         true,
     ///     "defaultTTL":  3600,
     ///     "records":     [ "www.example.org. 3600 IN A 192.0.2.10" ],
-    ///     "zones":       [ { "name": "example.org." } ]
+    ///     "zones":       [ { "name": "example.org." } ],
+    ///     "ssh":         { "enabled": true,
+    ///                      "clients": [ { "name": "cs001", "keys": [ "ssh-ed25519 AAAA... cs001" ] } ] }
     /// }
     /// </code>
     /// Every key may be left out, and then reads as its default. The records
@@ -51,7 +76,10 @@ namespace cloud.charging.open.DNSServer
     /// is the one form every kind of record has, so that a record the command
     /// line cannot make yet can still be written into the file by hand. The
     /// zones are those the name server is authoritative for, with the SOA and
-    /// NS records it makes for them (see <see cref="Zone"/>).
+    /// NS records it makes for them (see <see cref="Zone"/>). "ssh" says
+    /// whether DNS is answered over SSH as well, as the subsystem
+    /// "dns@open.charging.cloud" of the node's SSH server, and which machines
+    /// besides the accounts may ask there.
     /// </remarks>
     public sealed record DNSServerSettings
     {
@@ -111,6 +139,17 @@ namespace cloud.charging.open.DNSServer
         /// The zones the name server is authoritative for.
         /// </summary>
         public IReadOnlyList<Zone>    Zones         { get; init; } = [];
+
+        /// <summary>
+        /// Whether DNS is answered over SSH as well, as the subsystem
+        /// "dns@open.charging.cloud" of the node's SSH server.
+        /// </summary>
+        public Boolean                        SSHEnabled    { get; init; } = true;
+
+        /// <summary>
+        /// The machines that may ask over SSH.
+        /// </summary>
+        public IReadOnlyList<DNSClientEntry>  SSHClients    { get; init; } = [];
 
         #endregion
 
@@ -270,6 +309,62 @@ namespace cloud.charging.open.DNSServer
 
             #endregion
 
+            #region ssh
+
+            if (json["ssh"] is JToken sshToken && sshToken.Type != JTokenType.Null)
+            {
+
+                if (sshToken is not JObject ssh)
+                {
+                    Error = $"\"ssh\" of the \"{SectionName}\" section is no JSON object.";
+                    return false;
+                }
+
+                if (ssh["enabled"] is JToken enabledToken && enabledToken.Type is not (JTokenType.Null or JTokenType.Boolean))
+                {
+                    Error = $"\"ssh\".\"enabled\" of the \"{SectionName}\" section is neither true nor false: '{enabledToken}'.";
+                    return false;
+                }
+
+                var enabled  = ssh.Value<Boolean?>("enabled") ?? true;
+                var clients  = new List<DNSClientEntry>();
+
+                if (ssh["clients"] is JToken clientsToken && clientsToken.Type != JTokenType.Null)
+                {
+
+                    if (clientsToken is not JArray clientsArray)
+                    {
+                        Error = $"\"ssh\".\"clients\" of the \"{SectionName}\" section is a list of {{ \"name\", \"keys\" }}.";
+                        return false;
+                    }
+
+                    foreach (var clientToken in clientsArray)
+                    {
+
+                        if (!TryParseClient(clientToken, out var client, out Error))
+                            return false;
+
+                        if (clients.Any(known => String.Equals(known.Name, client.Name, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            Error = $"The DNS client '{client.Name}' is listed twice in \"ssh\".\"clients\" of the \"{SectionName}\" section.";
+                            return false;
+                        }
+
+                        clients.Add(client);
+
+                    }
+
+                }
+
+                settings = settings with {
+                               SSHEnabled  = enabled,
+                               SSHClients  = clients
+                           };
+
+            }
+
+            #endregion
+
             if (!settings.UDP && !settings.TCP)
             {
                 Error = $"The \"{SectionName}\" section switches off both UDP and TCP: DNS would be answered nowhere.";
@@ -277,6 +372,120 @@ namespace cloud.charging.open.DNSServer
             }
 
             Settings = settings;
+            return true;
+
+        }
+
+        #endregion
+
+        #region (static) TryParseClient(JSON, out Client, out Error)
+
+        /// <summary>
+        /// One DNS client: { "name": "cs001", "keys": [ "ssh-ed25519 AAAA..." ], "enabled": true }.
+        /// </summary>
+        public static Boolean TryParseClient(JToken?                                  JSON,
+                                             [NotNullWhen(true)]  out DNSClientEntry? Client,
+                                             [NotNullWhen(false)] out String?         Error)
+        {
+
+            Client = null;
+
+            if (JSON is not JObject json)
+            {
+                Error = $"An entry of \"ssh\".\"clients\" of the \"{SectionName}\" section is no JSON object.";
+                return false;
+            }
+
+            var name = json["name"]?.Type == JTokenType.String
+                           ? json.Value<String>("name")!.Trim()
+                           : "";
+
+            if (!IsClientName(name))
+            {
+                Error = $"'{name}' can not name a DNS client: letters, digits and . _ @ + -, not beginning with a dot, at most 128 characters.";
+                return false;
+            }
+
+            var keys = new List<String>();
+
+            if (json["keys"] is JArray keysArray)
+            {
+                foreach (var keyToken in keysArray)
+                {
+
+                    var line = keyToken.Type == JTokenType.String
+                                   ? keyToken.Value<String>()!.Trim()
+                                   : "";
+
+                    if (!IsAuthorizedKeyLine(line, out var why))
+                    {
+                        Error = $"A key of the DNS client '{name}' is no authorized_keys line: {why}";
+                        return false;
+                    }
+
+                    if (!keys.Contains(line))
+                        keys.Add(line);
+
+                }
+            }
+
+            else if (json["keys"] is JToken other && other.Type != JTokenType.Null)
+            {
+                Error = $"\"keys\" of the DNS client '{name}' is a list of authorized_keys lines.";
+                return false;
+            }
+
+            if (json["enabled"] is JToken enabledToken && enabledToken.Type is not (JTokenType.Null or JTokenType.Boolean))
+            {
+                Error = $"\"enabled\" of the DNS client '{name}' is neither true nor false: '{enabledToken}'.";
+                return false;
+            }
+
+            Client = new DNSClientEntry(
+                         name,
+                         keys,
+                         json.Value<Boolean?>("enabled") ?? true
+                     );
+
+            Error = null;
+            return true;
+
+        }
+
+        #endregion
+
+        #region (static) IsClientName(Name) / IsAuthorizedKeyLine(Line, out Why)
+
+        /// <summary>
+        /// What a login name of a DNS client may be: what the node's accounts
+        /// may be called.
+        /// </summary>
+        public static Boolean IsClientName(String Name)
+
+            => protocols.WWCP.Node.SecureShell.AuthorizedKeysStore.IsAccountName(Name);
+
+        /// <summary>
+        /// Whether the line is one authorized_keys line Hermod can hold a key to:
+        /// a client's own key, or with cert-authority the key of an SSH CA whose
+        /// user certificates let the client in.
+        /// </summary>
+        public static Boolean IsAuthorizedKeyLine(String                            Line,
+                                                  [NotNullWhen(false)] out String?  Why)
+        {
+
+            if (Line.Length == 0 || Line.Contains('\n'))
+            {
+                Why = "it is empty, or more than one line.";
+                return false;
+            }
+
+            if (!org.GraphDefined.Vanaheimr.Hermod.SSH.AuthorizedKeysFile.TryParseLine(Line, out var entry) || entry is null)
+            {
+                Why = $"'{(Line.Length > 40 ? Line[..40] + "..." : Line)}' could not be read as one.";
+                return false;
+            }
+
+            Why = null;
             return true;
 
         }
@@ -381,7 +590,18 @@ namespace cloud.charging.open.DNSServer
                    new JProperty("tcp",         TCP),
                    new JProperty("defaultTTL",  (Int64) DefaultTTL.TotalSeconds),
                    new JProperty("records",     new JArray(Records)),
-                   new JProperty("zones",       new JArray(Zones.Select(zone => zone.ToJSON())))
+                   new JProperty("zones",       new JArray(Zones.Select(zone => zone.ToJSON()))),
+                   new JProperty("ssh",         SSHToJSON())
+               );
+
+        /// <summary>
+        /// The "ssh" of the section: whether DNS is answered over SSH, and to whom.
+        /// </summary>
+        public JObject SSHToJSON()
+
+            => new (
+                   new JProperty("enabled",  SSHEnabled),
+                   new JProperty("clients",  new JArray(SSHClients.Select(client => client.ToJSON())))
                );
 
         #endregion

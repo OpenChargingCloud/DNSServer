@@ -26,13 +26,22 @@ namespace cloud.charging.open.DNSServer
 
     /// <summary>
     /// What a DNS server adds to the resources every node has, and the roles
-    /// of the people around it.
+    /// of the people - and machines - around it.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// Two resources, because they are two different things to be trusted
+    /// with. The name server itself - its records, its zones and the DNS
+    /// clients it lets in over SSH - is what an operator reads and a
+    /// hostmaster changes. A query over SSH is what a machine that resolves
+    /// its names here runs, and nothing else.
+    /// </para>
+    /// <para>
     /// The node brings the viewer, who may look at everything, and the
     /// administrators, who may do everything. The configuration file may add
     /// roles and say differently what one of them may do - see the node's
     /// "roles" section.
+    /// </para>
     /// </remarks>
     public static class DNSServerAccess
     {
@@ -40,15 +49,28 @@ namespace cloud.charging.open.DNSServer
         #region Resources
 
         /// <summary>
-        /// The name server: read, what it listens on, how much it answered and
-        /// the records it answers with; edited, its records.
+        /// The name server: read, what it listens on, how much it answered, the
+        /// records and zones it answers with and who asked over SSH; edited, its
+        /// records, its zones and the DNS clients it lets in over SSH.
         /// </summary>
         public const String  NameServer  = "nameserver";
 
         /// <summary>
-        /// The one resource of a DNS server's own.
+        /// DNS over SSH: run, queries over the SSH subsystem
+        /// "dns@open.charging.cloud", by an account of this node signed in with
+        /// one of its SSH keys.
         /// </summary>
-        public static readonly IReadOnlyList<String>  Resources = [ NameServer ];
+        /// <remarks>
+        /// For an account. A machine that is nothing but a DNS client is better
+        /// one of the DNS clients of the "dnsServer" section, which the node
+        /// confines to the queries - no command line, no SFTP.
+        /// </remarks>
+        public const String  Query       = "dnsquery";
+
+        /// <summary>
+        /// Both.
+        /// </summary>
+        public static readonly IReadOnlyList<String>  Resources = [ NameServer, Query ];
 
         #endregion
 
@@ -76,9 +98,17 @@ namespace cloud.charging.open.DNSServer
                                                         "keeps the records of the DNS server: looks at everything, and adds and removes records");
 
         /// <summary>
-        /// Both, in the order a sentence naming them reads best.
+        /// An account that is a DNS client and nothing else: it may ask the
+        /// name server over SSH, and look at nothing.
         /// </summary>
-        public static readonly IReadOnlyList<Role>  Roles = [ Operator, Hostmaster ];
+        public static readonly Role  DNSClient   = new ("dnsclient",
+                                                        [ Permission.Run(Query) ],
+                                                        "asks the name server over SSH, and nothing else");
+
+        /// <summary>
+        /// All three, in the order a sentence naming them reads best.
+        /// </summary>
+        public static readonly IReadOnlyList<Role>  Roles = [ Operator, Hostmaster, DNSClient ];
 
         #endregion
 

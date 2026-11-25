@@ -61,6 +61,9 @@ export const nameServerPage: Page = {
                         <div class="kv"><span class="k">Address</span> <span class="v" id="listen">${Status.listen === 'any' ? 'every address of both families' : Status.listen}</span></div>
                         <div class="kv"><span class="k">UDP</span>     <span class="v" id="udp">${Status.udp ?? (Settings.udp ? 'not listening' : 'switched off')}</span></div>
                         <div class="kv"><span class="k">TCP</span>     <span class="v" id="tcp">${Status.tcp ?? (Settings.tcp ? 'not listening' : 'switched off')}</span></div>
+                        <div class="kv"><span class="k">SSH</span>     <span class="v" id="over-ssh">${Status.ssh.served
+                                                                                                   ? `${Status.ssh.url ?? ''}, ${Status.ssh.clients} DNS client${Status.ssh.clients === 1 ? '' : 's'}`
+                                                                                                   : Status.ssh.enabled ? 'switched on, but the SSH server is off' : 'switched off'}</span></div>
                     </div>
 
                     ${askWith(Status)}
@@ -68,7 +71,7 @@ export const nameServerPage: Page = {
                     <p class="hint">
                         Where it listens is said by the "dnsServer" section of the configuration file, or by
                         <code>--dns-port</code>, <code>--listen</code>, <code>--no-udp</code> and <code>--no-tcp</code>
-                        at a start.
+                        at a start. Who may ask over SSH is said on the <a href="${toURL('/dnsServer/clients')}">DNS clients</a> page.
                     </p>
 
                 </section>
