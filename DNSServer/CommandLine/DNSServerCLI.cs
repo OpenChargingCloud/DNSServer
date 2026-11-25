@@ -39,7 +39,8 @@ namespace cloud.charging.open.DNSServer.CommandLine
     /// The constructor registers this type as well, so that this assembly is
     /// walked for anything that implements ICLICommand and can be built from a
     /// DNSServerCLI: a command of the name server's own is a new file and
-    /// nothing else - 'dnsServer', 'records' and 'aRecords' among them.
+    /// nothing else - 'dnsServer', 'records', 'aRecords', 'aaaaRecords',
+    /// 'txtRecords' and 'cnameRecords' among them.
     /// </para>
     /// <para>
     /// Here, beside the name server, and not in the program that runs it: what

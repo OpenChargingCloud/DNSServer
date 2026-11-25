@@ -140,6 +140,88 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region AAAA_TXT_AndCNAMERecordsAreChangedOverTheJSONAPI()
+
+        /// <summary>
+        /// An AAAA, a TXT and a CNAME record added and removed: each with the key
+        /// of its type - "address", "text", "target" - and listed with the value
+        /// it is removed by; a text taken as it is, quotes and spaces included;
+        /// and a record beside a CNAME refused.
+        /// </summary>
+        [Test]
+        public async Task AAAA_TXT_AndCNAMERecordsAreChangedOverTheJSONAPI()
+        {
+
+            using var http          = await SignedIn();
+
+            var text                = " v=spf1 \"quoted\" -all";
+
+            var (aaaa, aaaaAnswer)  = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/aaaa",
+                                                 new JObject(new JProperty("name",     "www.example.org"),
+                                                             new JProperty("address",  "2001:db8::10")));
+
+            var (txt,  txtAnswer)   = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/txt",
+                                                 new JObject(new JProperty("name",     "example.org"),
+                                                             new JProperty("text",     text),
+                                                             new JProperty("ttl",      300)));
+
+            var (cname, cnameAnswer) = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/cname",
+                                                 new JObject(new JProperty("name",     "docs.example.org"),
+                                                             new JProperty("target",   "www.example.org")));
+
+            Assert.Multiple(() => {
+                Assert.That(aaaa,   Is.EqualTo(HttpStatusCode.OK), aaaaAnswer. ToString());
+                Assert.That(txt,    Is.EqualTo(HttpStatusCode.OK), txtAnswer.  ToString());
+                Assert.That(cname,  Is.EqualTo(HttpStatusCode.OK), cnameAnswer.ToString());
+            });
+
+            var records             = JArray.Parse(await http.GetStringAsync("api/v1/dnsServer/records"));
+            var byType              = records.ToDictionary(record => record["type"]!.Value<String>()!);
+
+            Assert.Multiple(() => {
+                Assert.That(records.Count,                                    Is.EqualTo(3));
+                Assert.That(byType["AAAA"] ["value"]!.Value<String>(),        Is.EqualTo("2001:db8::10"));
+                Assert.That(byType["TXT"]  ["value"]!.Value<String>(),        Is.EqualTo(text), "the text as it was sent");
+                Assert.That(byType["TXT"]  ["data"]! .Value<String>(),        Is.EqualTo("\" v=spf1 \\\"quoted\\\" -all\""), "the text as a zone file writes it");
+                Assert.That(byType["TXT"]  ["ttl"]!  .Value<Int64>(),         Is.EqualTo(300));
+                Assert.That(byType["CNAME"]["value"]!.Value<String>(),        Is.EqualTo("www.example.org."));
+            });
+
+            var (beside, why)       = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/a",
+                                                 new JObject(new JProperty("name",     "docs.example.org"),
+                                                             new JProperty("address",  "192.0.2.10")));
+
+            Assert.That(beside,                                        Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
+            Assert.That(why.ToString(),                                Does.Contain("alias"));
+
+            var (noKey, missing)    = await Send(http, HttpMethod.Post, "api/v1/dnsServer/records/txt",
+                                                 new JObject(new JProperty("name",     "example.org"),
+                                                             new JProperty("address",  "192.0.2.10")));
+
+            Assert.That(noKey,                                         Is.EqualTo(HttpStatusCode.BadRequest), missing.ToString());
+            Assert.That(missing.ToString(),                            Does.Contain("\\\"text\\\" is missing"));
+
+            foreach (var (type, key, value) in new[] { ("aaaa",  "address", "2001:db8::10"),
+                                                       ("txt",   "text",    text),
+                                                       ("cname", "target",  "www.example.org.") })
+            {
+
+                var name            = byType[type.ToUpperInvariant()]["name"]!.Value<String>()!;
+
+                var (removed, after) = await Send(http, HttpMethod.Post, $"api/v1/dnsServer/records/{type}/remove",
+                                                  new JObject(new JProperty("name",  name),
+                                                              new JProperty(key,     value)));
+
+                Assert.That(removed,                                   Is.EqualTo(HttpStatusCode.OK), after.ToString());
+
+            }
+
+            Assert.That(((DNSServerNode) Node).Records.Count,          Is.Zero);
+
+        }
+
+        #endregion
+
         #region AnOperatorMayReadTheRecordsButNotChangeThem()
 
         [Test]

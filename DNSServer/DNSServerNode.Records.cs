@@ -17,7 +17,9 @@
 
 #region Usings
 
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Diagnostics.CodeAnalysis;
 
 using Newtonsoft.Json.Linq;
 
@@ -82,35 +84,46 @@ namespace cloud.charging.open.DNSServer
     public partial class DNSServerNode
     {
 
-        #region AddA(Name, Address, TTL, By)
+        #region Add(Type, Name, Data, TTL, By)
 
         /// <summary>
-        /// The given name answers with the given IPv4 address as well, from now
-        /// on - as the command line's "aRecords add" and the JSON API's
-        /// POST v1/dnsServer/records/a say it.
+        /// The given name answers with a record of the given type as well, from
+        /// now on - as the command line's "aRecords add", "aaaaRecords add",
+        /// "txtRecords add" and "cnameRecords add" and the JSON API's
+        /// POST v1/dnsServer/records/{type} say it.
         /// </summary>
+        /// <param name="Type">A, AAAA, TXT or CNAME.</param>
         /// <param name="Name">The name, complete; a trailing dot is optional.</param>
-        /// <param name="Address">The IPv4 address, as it was typed.</param>
+        /// <param name="Data">What it answers with, as it was typed: the IPv4 or IPv6 address, the text, the name it is an alias of.</param>
         /// <param name="TTL">The TTL as it was typed - seconds, or with s, m, h or d after it - or null for the "defaultTTL".</param>
         /// <param name="By">Who added it, for the log.</param>
-        public RecordsChange AddA(String   Name,
-                                  String   Address,
-                                  String?  TTL,
-                                  String   By)
+        public RecordsChange Add(DNSResourceRecordTypes  Type,
+                                 String                  Name,
+                                 String                  Data,
+                                 String?                 TTL,
+                                 String                  By)
         {
 
-            if (!IPv4Address.TryParse(Address.Trim(), out var address))
-                return new ($"'{Address}' is no IPv4 address.", null, RecordsChangeOutcome.Refused);
+            if (!ResourceRecords.Changeable.Contains(Type))
+                return new ($"A record of the type {ADNSResourceRecord.TypeName(Type)} is written into the \"dnsServer\" section by hand.", null, RecordsChangeOutcome.Refused);
+
+            if (!ResourceRecords.TryParseName(Name, out var domainName, out var error))
+                return new (error, null, RecordsChangeOutcome.Refused);
 
             var ttl = Settings.DefaultTTL;
 
             if (!String.IsNullOrWhiteSpace(TTL) && !DNSServerSettings.TryParseTTL(TTL, out ttl))
                 return new ($"'{TTL}' is no TTL: a number of seconds, or one with s, m, h or d after it.", null, RecordsChangeOutcome.Refused);
 
-            if (!Records.TryAddA(Name, address, ttl, out var record, out var note, out var error, out var notSaved))
+            if (!TryMake(Type, domainName, Data, ttl, out var record, out error))
+                return new (error, null, RecordsChangeOutcome.Refused);
+
+            if (!Records.TryAdd(record, out var note, out error, out var notSaved))
                 return new (error, null, notSaved ? RecordsChangeOutcome.NotSaved : RecordsChangeOutcome.Refused);
 
-            var said = $"{record.DomainName.FullName} answers with {address} from now on, TTL {(Int64) ttl.TotalSeconds} s.";
+            var said = record is CNAME cname
+                           ? $"{domainName.FullName} is an alias of {cname.CName.FullName} from now on, TTL {(Int64) ttl.TotalSeconds} s."
+                           : $"{domainName.FullName} answers with {ResourceRecords.Said(record)} from now on, TTL {(Int64) ttl.TotalSeconds} s.";
 
             Log.Notice($"{said} ({By})", "dnsserver", "records");
 
@@ -120,54 +133,152 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
-        #region RemoveA(Name, Address, By)
+        #region Remove(Type, Name, Data, By)
 
         /// <summary>
-        /// The given name no longer answers with the given IPv4 address - or
-        /// with any, where none is given - as the command line's "aRecords
-        /// remove" and the JSON API's POST v1/dnsServer/records/a/remove say it.
+        /// The given name no longer answers with the given record of the given
+        /// type - with any of the type, where no data is given - as the command
+        /// line's "... remove" and the JSON API's
+        /// POST v1/dnsServer/records/{type}/remove say it.
         /// </summary>
+        /// <param name="Type">A, AAAA, TXT or CNAME.</param>
         /// <param name="Name">The name, complete; a trailing dot is optional.</param>
-        /// <param name="Address">The IPv4 address as it was typed, or null for every one.</param>
+        /// <param name="Data">What the record answers with, as it was typed - the IPv4 or IPv6 address, the text, the name it is an alias of - or null for every record of the type.</param>
         /// <param name="By">Who removed it, for the log.</param>
-        public RecordsChange RemoveA(String   Name,
-                                     String?  Address,
-                                     String   By)
+        public RecordsChange Remove(DNSResourceRecordTypes  Type,
+                                    String                  Name,
+                                    String?                 Data,
+                                    String                  By)
         {
 
-            IPv4Address? address = null;
+            var type = ADNSResourceRecord.TypeName(Type);
 
-            if (!String.IsNullOrWhiteSpace(Address))
+            if (!ResourceRecords.Changeable.Contains(Type))
+                return new ($"A record of the type {type} is taken out of the \"dnsServer\" section by hand.", null, RecordsChangeOutcome.Refused);
+
+            Func<IDNSResourceRecord, Boolean>? matches = null;
+            String?                            said    = null;
+
+            if (!String.IsNullOrEmpty(Data))
             {
 
-                if (!IPv4Address.TryParse(Address.Trim(), out var parsed))
-                    return new ($"'{Address}' is no IPv4 address.", null, RecordsChangeOutcome.Refused);
+                // The record it would be, made with the name and data given, and
+                // matched by what it answers with.
+                if (!ResourceRecords.TryParseName(Name, out var domainName, out var error) ||
+                    !TryMake(Type, domainName, Data, Settings.DefaultTTL, out var wanted, out error))
+                    return new (error, null, RecordsChangeOutcome.Refused);
 
-                address = parsed;
+                matches  = record => ResourceRecords.SameData(record, wanted);
+                said     = ResourceRecords.Said(wanted);
 
             }
 
-            if (!Records.TryRemove(Name,
-                                   DNSResourceRecordTypes.A,
-                                   address.HasValue
-                                       ? record => record is A a && a.IPv4Address == address.Value
-                                       : null,
-                                   out var removed,
-                                   out var notSaved))
+            if (!Records.TryRemove(Name, Type, matches, out var removed, out var notSaved))
                 return new (notSaved, null, RecordsChangeOutcome.NotSaved);
 
             if (removed.Count == 0)
-                return new (address.HasValue
-                                ? $"{Name} does not answer with {address.Value}: nothing was removed."
-                                : $"{Name} has no A record: nothing was removed.",
+                return new (said is not null
+                                ? $"{Name} does not answer with {said}: nothing was removed."
+                                : $"{Name} has no {type} record: nothing was removed.",
                             null,
                             RecordsChangeOutcome.NothingMatched);
 
-            var said = $"{removed[0].DomainName.FullName} no longer answers with {String.Join(", ", removed.OfType<A>().Select(a => a.IPv4Address))}.";
+            var fullName  = removed[0].DomainName.FullName;
 
-            Log.Notice($"{said} ({By})", "dnsserver", "records");
+            var told      = removed[0] is CNAME cname
+                                ? $"{fullName} is no longer an alias of {cname.CName.FullName}."
+                                : $"{fullName} no longer answers with {String.Join(", ", removed.Select(ResourceRecords.Said))}.";
 
-            return new (said, null, RecordsChangeOutcome.Changed);
+            Log.Notice($"{told} ({By})", "dnsserver", "records");
+
+            return new (told, null, RecordsChangeOutcome.Changed);
+
+        }
+
+        #endregion
+
+        #region (static) TryMake(Type, Name, Data, TTL, out Record, out Error)
+
+        /// <summary>
+        /// The most a TXT record's data may hold: 65535 octets of RDATA, each
+        /// character-string of at most 255 octets with one of its length before it.
+        /// </summary>
+        private const Int32 MaxTXTRData = UInt16.MaxValue;
+
+        /// <summary>
+        /// The record of the given type the given name answers with, made from
+        /// the data as it was typed.
+        /// </summary>
+        public static Boolean TryMake(DNSResourceRecordTypes                        Type,
+                                      DomainName                                    Name,
+                                      String                                        Data,
+                                      TimeSpan                                      TTL,
+                                      [NotNullWhen(true)]  out IDNSResourceRecord?  Record,
+                                      [NotNullWhen(false)] out String?              Error)
+        {
+
+            Record  = null;
+            Error   = null;
+
+            switch (Type)
+            {
+
+                case DNSResourceRecordTypes.A:
+                    if (!IPv4Address.TryParse(Data.Trim(), out var ipv4))
+                    {
+                        Error = $"'{Data}' is no IPv4 address.";
+                        return false;
+                    }
+                    Record = new A(Name, DNSQueryClasses.IN, TTL, ipv4);
+                    return true;
+
+                case DNSResourceRecordTypes.AAAA:
+                    if (!IPv6Address.TryParse(Data.Trim(), out var ipv6))
+                    {
+                        Error = $"'{Data}' is no IPv6 address.";
+                        return false;
+                    }
+                    Record = new AAAA(Name, DNSQueryClasses.IN, TTL, ipv6);
+                    return true;
+
+                case DNSResourceRecordTypes.TXT:
+
+                    if (Data.Length == 0)
+                    {
+                        Error = "A TXT record needs a text.";
+                        return false;
+                    }
+
+                    var txt = new TXT(Name, DNSQueryClasses.IN, TTL, Data);
+
+                    if (txt.Strings.Sum(text => Encoding.UTF8.GetByteCount(text) + 1) > MaxTXTRData)
+                    {
+                        Error = $"The text is too long for one TXT record: it holds {MaxTXTRData} octets at most.";
+                        return false;
+                    }
+
+                    Record = txt;
+                    return true;
+
+                case DNSResourceRecordTypes.CNAME:
+
+                    if (String.IsNullOrWhiteSpace(Data))
+                    {
+                        Error = "A CNAME needs the name it is an alias of.";
+                        return false;
+                    }
+
+                    if (!ResourceRecords.TryParseName(Data, out var target, out Error))
+                        return false;
+
+                    Record = new CNAME(Name, DNSQueryClasses.IN, TTL, target);
+                    return true;
+
+                default:
+                    Error = $"A record of the type {ADNSResourceRecord.TypeName(Type)} is written into the \"dnsServer\" section by hand.";
+                    return false;
+
+            }
 
         }
 
@@ -208,6 +319,7 @@ namespace cloud.charging.open.DNSServer
                        new JProperty("class",  ADNSResourceRecord.ClassName(Record.Class)),
                        new JProperty("ttl",    (Int64) Record.TimeToLive.TotalSeconds),
                        new JProperty("data",   parts.Success ? parts.Groups[5].Value.Trim() : null),
+                       new JProperty("value",  ResourceRecords.ValueOf(Record)),
                        new JProperty("line",   Regex.Replace(line.Trim(), @"\s+", " "))
                    );
 

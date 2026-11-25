@@ -1,4 +1,4 @@
-import { api, type RecordsChanged, type ResourceRecord } from '../api/client';
+import { api, changeableTypes, isChangeable, keyOf, type ChangeableType, type NewRecord, type RecordsChanged, type ResourceRecord } from '../api/client';
 import { auth } from '../auth';
 import type { Page } from '@node/router';
 import { mayButNot, reloadButton, shell } from '@node/shell';
@@ -8,13 +8,13 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
 
 /**
  * The records the name server answers with: every one of them, of every type,
- * and the A records added and removed here.
+ * and the A, AAAA, TXT and CNAME records added and removed here.
  *
  * Every change is sent at once and is in effect at once - answered from then
  * on, and written to the configuration file - and the page draws the records
  * as the node answers with them, not as they were sent. A record of another
- * type - AAAA, MX, TXT - is written into the "dnsServer" section by hand, and
- * is listed here from the next start on.
+ * type - MX, SRV - is written into the "dnsServer" section by hand, and is
+ * listed here from the next start on.
  */
 export const recordsPage: Page = {
 
@@ -36,6 +36,9 @@ export const recordsPage: Page = {
         let cancelled = false;
         let current: ResourceRecord[] | null = null;
 
+        /** The type the form makes a record of. */
+        let picked: ChangeableType = 'A';
+
 
         function draw(): void {
 
@@ -54,7 +57,7 @@ export const recordsPage: Page = {
 
                 <div class="cards stacked">
                     ${recordsCard(records)}
-                    ${addACard()}
+                    ${addCard()}
                 </div>
 
             `);
@@ -62,7 +65,7 @@ export const recordsPage: Page = {
         }
 
 
-        /** Every record, each A record with what removes it. */
+        /** Every record, each of a type that is changed here with what removes it. */
         function recordsCard(Records: ResourceRecord[]): TemplateResult {
 
             return html`
@@ -98,16 +101,18 @@ export const recordsPage: Page = {
 
         function recordRow(Record: ResourceRecord): TemplateResult {
 
+            const type = Record.type;
+
             return html`
                 <tr data-record="${Record.line}">
                     <td class="record-name">${Record.name}</td>
-                    <td class="record-type"><span class="chip">${Record.type}</span></td>
+                    <td class="record-type"><span class="chip">${type}</span></td>
                     <td class="record-ttl">${Record.ttl} s</td>
                     <td class="record-data">${Record.data ?? ''}</td>
                     <td class="record-actions">
-                        ${Record.type === 'A' ? html`
-                            <button type="button" class="btn small danger" data-remove="${Record.name} ${Record.data ?? ''}" ?disabled=${!mayChange}
-                                    @click=${() => void removeA(Record)}>Remove</button>
+                        ${isChangeable(type) && Record.value !== null ? html`
+                            <button type="button" class="btn small danger" data-remove="${Record.name} ${type} ${Record.value}" ?disabled=${!mayChange}
+                                    @click=${() => void remove(type, Record)}>Remove</button>
                         ` : nothing}
                     </td>
                 </tr>
@@ -116,15 +121,47 @@ export const recordsPage: Page = {
         }
 
 
-        /** The form of a new A record: a name, its IPv4 address, and a TTL where not the default. */
-        function addACard(): TemplateResult {
+        /** What the form asks for, for each type: what the data is called, an example, and what to know. */
+        const asked: Record<ChangeableType, { label: string; placeholder: string; inputmode: string; hint: string }> = {
+            A:      { label:        'IPv4 address',
+                      placeholder:  '192.0.2.10',
+                      inputmode:    'decimal',
+                      hint:         'A name may answer with several: each is a record of its own.' },
+            AAAA:   { label:        'IPv6 address',
+                      placeholder:  '2001:db8::10',
+                      inputmode:    'text',
+                      hint:         'A name may answer with several: each is a record of its own.' },
+            TXT:    { label:        'Text',
+                      placeholder:  'v=spf1 -all',
+                      inputmode:    'text',
+                      hint:         'Taken as it is, spaces and quotes included - no quotes around it. A text longer than ' +
+                                    '255 octets is answered in pieces, which a reader puts together again.' },
+            CNAME:  { label:        'Alias of',
+                      placeholder:  'www.example.org',
+                      inputmode:    'text',
+                      hint:         'The name this one is an alias of, complete. A name with a CNAME has no other record, ' +
+                                    'and one CNAME only.' }
+        };
+
+
+        /** The form of a new record: its type, a name, what it answers with, and a TTL where not the default. */
+        function addCard(): TemplateResult {
+
+            const ask = asked[picked];
 
             return html`
-                <section class="card" id="add-a-card">
+                <section class="card" id="add-record-card">
 
-                    <h2><i class="fa-solid fa-plus"></i> A new A record</h2>
+                    <h2><i class="fa-solid fa-plus"></i> A new record</h2>
 
-                    <form id="add-a" class="form-stack" @submit=${onAddA}>
+                    <form id="add-record" class="form-stack" @submit=${onAdd}>
+
+                        <label>Type
+                            <select name="type" id="add-record-type" ?disabled=${!mayChange}
+                                    @change=${(event: Event) => pick((event.target as HTMLSelectElement).value)}>
+                                ${changeableTypes.map(type => html`<option value="${type}" ?selected=${type === picked}>${type}</option>`)}
+                            </select>
+                        </label>
 
                         <label>Name
                             <input type="text" name="name" required autocomplete="off" spellcheck="false"
@@ -132,10 +169,10 @@ export const recordsPage: Page = {
                             <span class="hint">Complete, with or without its trailing dot.</span>
                         </label>
 
-                        <label>IPv4 address
-                            <input type="text" name="address" required autocomplete="off" spellcheck="false" inputmode="decimal"
-                                   placeholder="192.0.2.10" ?disabled=${!mayChange} />
-                            <span class="hint">A name may answer with several: each is a record of its own.</span>
+                        <label><span id="add-record-data-label">${ask.label}</span>
+                            <input type="text" name="data" required autocomplete="off" spellcheck="false"
+                                   inputmode="${ask.inputmode}" placeholder="${ask.placeholder}" ?disabled=${!mayChange} />
+                            <span class="hint" id="add-record-data-hint">${ask.hint}</span>
                         </label>
 
                         <label>TTL
@@ -143,15 +180,15 @@ export const recordsPage: Page = {
                                    placeholder="1h" ?disabled=${!mayChange} />
                             <span class="hint">
                                 How long a resolver may keep the answer: seconds, or with s, m, h or d after them. Empty, the
-                                default TTL of the "dnsServer" section. The A records of one name share their TTL, so a TTL
-                                given here is the others' as well.
+                                default TTL of the "dnsServer" section. The records of one name and type share their TTL, so a
+                                TTL given here is the others' as well.
                             </span>
                         </label>
 
                         <div class="form-actions">
                             <button type="submit" class="btn primary" ?disabled=${!mayChange}>Add the record</button>
-                            <span id="add-a-note"  class="form-notice" role="status"></span>
-                            <span id="add-a-error" class="form-error"  role="alert"></span>
+                            <span id="add-record-note"  class="form-notice" role="status"></span>
+                            <span id="add-record-error" class="form-error"  role="alert"></span>
                         </div>
 
                     </form>
@@ -162,27 +199,45 @@ export const recordsPage: Page = {
         }
 
 
-        function onAddA(event: SubmitEvent): void {
+        /** Another type picked: the form asks for what that type answers with - what was typed stays. */
+        function pick(Type: string): void {
 
-            event.preventDefault();
+            if (!isChangeable(Type) || Type === picked)
+                return;
 
-            const form     = event.currentTarget as HTMLFormElement;
-            const name     = field(form, 'name');
-            const address  = field(form, 'address');
-            const ttl      = field(form, 'ttl');
-
-            void change(() => api.dnsServer.addA(ttl.length > 0 ? { name, address, ttl } : { name, address }),
-                        '#add-a', form);
+            picked = Type;
+            draw();
 
         }
 
 
-        function removeA(Record: ResourceRecord): Promise<void> {
+        function onAdd(event: SubmitEvent): void {
 
-            if (!confirm(`Remove ${Record.name} ${Record.data ?? ''}? It is no longer answered with from then on.`))
+            event.preventDefault();
+
+            const form    = event.currentTarget as HTMLFormElement;
+            const type    = picked;
+            const name    = field(form, 'name');
+            // A text is answered with as it is; every other value is trimmed.
+            const data    = field(form, 'data', type !== 'TXT');
+            const ttl     = field(form, 'ttl');
+
+            const record: NewRecord = { name, [keyOf(type)]: data };
+
+            if (ttl.length > 0)
+                record.ttl = ttl;
+
+            void change(() => api.dnsServer.add(type, record), '#add-record', form);
+
+        }
+
+
+        function remove(Type: ChangeableType, Record: ResourceRecord): Promise<void> {
+
+            if (!confirm(`Remove ${Record.name} ${Type} ${Record.data ?? ''}? It is no longer answered with from then on.`))
                 return Promise.resolve();
 
-            return change(() => api.dnsServer.removeA({ name: Record.name, address: Record.data ?? '' }), '#records');
+            return change(() => api.dnsServer.remove(Type, { name: Record.name, [keyOf(Type)]: Record.value ?? '' }), '#records');
 
         }
 
@@ -193,7 +248,7 @@ export const recordsPage: Page = {
          * from, or of the list.
          */
         async function change(Send:  () => Promise<RecordsChanged>,
-                              From:  '#add-a' | '#records',
+                              From:  '#add-record' | '#records',
                               Form:  HTMLFormElement | null = null): Promise<void> {
 
             const note   = content.querySelector<HTMLElement>(`${From}-note`);
@@ -241,7 +296,7 @@ export const recordsPage: Page = {
 
                 // Loaded anew - Reload - is what the node has, the form too.
                 draw();
-                content.querySelector<HTMLFormElement>('#add-a')?.reset();
+                content.querySelector<HTMLFormElement>('#add-record')?.reset();
 
             }
             catch (problem)

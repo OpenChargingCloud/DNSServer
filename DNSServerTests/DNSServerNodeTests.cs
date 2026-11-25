@@ -173,6 +173,31 @@ namespace cloud.charging.open.DNSServer.Tests
                                                                                                          Boolean        OverTCP = false)
         {
 
+            var (responseCode, authoritative, answers) = await AskFor(Node, Name, 1, OverTCP);
+
+            return (responseCode,
+                    authoritative,
+                    [ .. answers.Where(answer => answer.Type == 1).Select(answer => answer.Data).Order() ]);
+
+        }
+
+        #endregion
+
+        #region (private static) AskFor(Node, Name, Type, OverTCP = false)
+
+        /// <summary>
+        /// A query of the given type for the given name, sent as any resolver
+        /// would, and the response code and every record of the answer: its
+        /// type, and its data as a zone file says it - the address, the text of
+        /// a TXT record with its character-strings put together, the name a
+        /// CNAME points to.
+        /// </summary>
+        private static async Task<(Int32 ResponseCode, Boolean Authoritative, (UInt16 Type, String Data)[] Answers)> AskFor(DNSServerNode  Node,
+                                                                                                                              String         Name,
+                                                                                                                              UInt16         Type,
+                                                                                                                              Boolean        OverTCP = false)
+        {
+
             var query = new List<Byte> { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
             foreach (var label in Name.TrimEnd('.').Split('.'))
@@ -181,7 +206,7 @@ namespace cloud.charging.open.DNSServer.Tests
                 query.AddRange(System.Text.Encoding.ASCII.GetBytes(label));
             }
 
-            query.AddRange([ 0x00, 0x00, 0x01, 0x00, 0x01 ]);
+            query.AddRange([ 0x00, (Byte) (Type >> 8), (Byte) Type, 0x00, 0x01 ]);
 
             Byte[] response;
 
@@ -218,38 +243,94 @@ namespace cloud.charging.open.DNSServer.Tests
             Assert.That(BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(0, 2)), Is.EqualTo(0x1234), "the response's id");
 
             var flags     = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(2, 2));
-            var answers   = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(6, 2));
+            var count     = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(6, 2));
 
             // Past the question: the name as it was sent, then type and class.
-            var offset    = 12 + (query.Count - 12);
-            var addresses = new List<String>();
+            var offset    = query.Count;
+            var answers   = new List<(UInt16, String)>();
 
-            for (var i = 0; i < answers; i++)
+            for (var i = 0; i < count; i++)
             {
 
-                // The name: a pointer, or labels.
-                if ((response[offset] & 0xC0) == 0xC0)
-                    offset += 2;
-                else
-                {
-                    while (response[offset] != 0)
-                        offset += response[offset] + 1;
-                    offset++;
-                }
+                NameAt(response, ref offset);
 
                 var type      = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(offset,     2));
                 var rdLength  = BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(offset + 8, 2));
 
                 offset += 10;
 
-                if (type == 1 && rdLength == 4)
-                    addresses.Add($"{response[offset]}.{response[offset + 1]}.{response[offset + 2]}.{response[offset + 3]}");
+                var rdata     = offset;
+
+                answers.Add((type, type switch {
+                    1  when rdLength ==  4  => new System.Net.IPAddress(response.AsSpan(offset, 4)). ToString(),
+                    28 when rdLength == 16  => new System.Net.IPAddress(response.AsSpan(offset, 16)).ToString(),
+                    5                       => NameAt(response, ref rdata),
+                    16                      => TextAt(response, offset, rdLength),
+                    _                       => Convert.ToHexString(response, offset, rdLength)
+                }));
 
                 offset += rdLength;
 
             }
 
-            return (flags & 0x000F, (flags & 0x0400) != 0, [ .. addresses.Order() ]);
+            return (flags & 0x000F, (flags & 0x0400) != 0, [ .. answers ]);
+
+        }
+
+        /// <summary>
+        /// The name at the given offset - labels, a pointer, or labels and then a
+        /// pointer - with its trailing dot; the offset moved past it.
+        /// </summary>
+        private static String NameAt(Byte[] Message, ref Int32 Offset)
+        {
+
+            var labels  = new List<String>();
+            var at      = Offset;
+            var jumped  = false;
+
+            while (Message[at] != 0)
+            {
+
+                if ((Message[at] & 0xC0) == 0xC0)
+                {
+
+                    if (!jumped)
+                        Offset = at + 2;
+
+                    at      = ((Message[at] & 0x3F) << 8) | Message[at + 1];
+                    jumped  = true;
+                    continue;
+
+                }
+
+                labels.Add(System.Text.Encoding.ASCII.GetString(Message, at + 1, Message[at]));
+                at += Message[at] + 1;
+
+            }
+
+            if (!jumped)
+                Offset = at + 1;
+
+            return String.Join('.', labels) + ".";
+
+        }
+
+        /// <summary>
+        /// The character-strings of a TXT record, put together (RFC 7208 §3.3).
+        /// </summary>
+        private static String TextAt(Byte[] Message, Int32 Offset, Int32 Length)
+        {
+
+            var bytes = new List<Byte>();
+            var end   = Offset + Length;
+
+            while (Offset < end)
+            {
+                bytes.AddRange(Message.AsSpan(Offset + 1, Message[Offset]));
+                Offset += Message[Offset] + 1;
+            }
+
+            return System.Text.Encoding.UTF8.GetString([ .. bytes ]);
 
         }
 
@@ -427,6 +508,228 @@ namespace cloud.charging.open.DNSServer.Tests
             });
 
             Assert.That(node.Records.Count, Is.Zero);
+
+        }
+
+        #endregion
+
+        #region AAAA_TXT_AndCNAME_AreAnsweredAtOnce_AndSurviveARestart()
+
+        [Test]
+        public async Task AAAA_TXT_AndCNAME_AreAnsweredAtOnce_AndSurviveARestart()
+        {
+
+            var directory  = NewDirectory();
+            var first      = await Started(directory);
+
+            var aaaa       = await AtTheConsole(first, "aaaaRecords add www.example.org 2001:db8::10 10m");
+            var txt        = await AtTheConsole(first, "txtRecords add example.org \"v=spf1 ip6:2001:db8::/32 -all\"");
+            var cname      = await AtTheConsole(first, "cnameRecords add docs.example.org www.example.org");
+
+            Assert.Multiple(() => {
+                Assert.That(aaaa [0], Does.Contain("www.example.org. answers with 2001:db8::10").And.Contain("600 s"));
+                Assert.That(txt  [0], Does.Contain("example.org. answers with the text \"v=spf1 ip6:2001:db8::/32 -all\""));
+                Assert.That(cname[0], Does.Contain("docs.example.org. is an alias of www.example.org."));
+            });
+
+            async Task AnswersAsAdded(DNSServerNode node)
+            {
+
+                var askedAAAA   = await AskFor(node, "www.example.org",  28);
+                var askedTXT    = await AskFor(node, "example.org",      16, OverTCP: true);
+                var askedCNAME  = await AskFor(node, "docs.example.org", 5);
+
+                Assert.Multiple(() => {
+                    Assert.That(askedAAAA. Answers, Is.EqualTo(new[] { ((UInt16) 28, "2001:db8::10") }));
+                    Assert.That(askedTXT.  Answers, Is.EqualTo(new[] { ((UInt16) 16, "v=spf1 ip6:2001:db8::/32 -all") }));
+                    Assert.That(askedCNAME.Answers, Is.EqualTo(new[] { ((UInt16)  5, "www.example.org.") }));
+                    Assert.That(node.Records.Named("www.example.org")[0].TimeToLive, Is.EqualTo(TimeSpan.FromMinutes(10)));
+                });
+
+            }
+
+            await AnswersAsAdded(first);
+            await AnswersAsAdded(await Restarted(first, directory));
+
+            var lines      = JObject.Parse(File.ReadAllText(ConfigFileIn(directory)))[DNSServerSettings.SectionName]?["records"]?.Values<String>().ToArray();
+
+            Assert.That(lines, Has.Length.EqualTo(3));
+            Assert.That(lines![1], Does.Contain("TXT").And.Contain("\"v=spf1 ip6:2001:db8::/32 -all\""));
+
+        }
+
+        #endregion
+
+        #region ACNAME_StandsAlone()
+
+        [Test]
+        public async Task ACNAME_StandsAlone()
+        {
+
+            var node = await Started(NewDirectory());
+
+            await AtTheConsole(node, "aRecords add www.example.org 192.0.2.10");
+            await AtTheConsole(node, "cnameRecords add docs.example.org www.example.org");
+
+            var besideA       = await AtTheConsole(node, "cnameRecords add www.example.org other.example.org");
+            var besideCNAME   = await AtTheConsole(node, "txtRecords add docs.example.org \"some text\"");
+            var secondCNAME   = await AtTheConsole(node, "cnameRecords add docs.example.org other.example.org");
+            var itself        = await AtTheConsole(node, "cnameRecords add self.example.org SELF.example.org.");
+
+            Assert.Multiple(() => {
+                Assert.That(besideA    [0], Does.Contain("has records already (A)"));
+                Assert.That(besideCNAME[0], Does.Contain("is an alias of www.example.org.").And.Contain("no other record"));
+                Assert.That(secondCNAME[0], Does.Contain("one CNAME only"));
+                Assert.That(itself     [0], Does.Contain("cannot be an alias of itself"));
+            });
+
+            Assert.That(node.Records.Count, Is.EqualTo(2));
+
+            var removed       = await AtTheConsole(node, "cnameRecords remove docs.example.org");
+
+            Assert.That(removed[0], Does.Contain("docs.example.org. is no longer an alias of www.example.org."));
+
+            var nowItCan      = await AtTheConsole(node, "txtRecords add docs.example.org \"some text\"");
+
+            Assert.That(nowItCan[0], Does.Contain("answers with the text \"some text\""));
+
+        }
+
+        #endregion
+
+        #region AAAA_AndTXT_AreRemoved_OneByOne_OrAllOfAName()
+
+        [Test]
+        public async Task AAAA_AndTXT_AreRemoved_OneByOne_OrAllOfAName()
+        {
+
+            var node = await Started(NewDirectory());
+
+            await AtTheConsole(node, "aaaaRecords add host.example.org 2001:db8::1");
+            await AtTheConsole(node, "aaaaRecords add host.example.org 2001:db8::2");
+            await AtTheConsole(node, "txtRecords add host.example.org first");
+            await AtTheConsole(node, "txtRecords add host.example.org \"the second\"");
+
+            // The same address, written otherwise, is the same address.
+            var removedOne   = await AtTheConsole(node, "aaaaRecords remove host.example.org 2001:0db8:0:0:0:0:0:1");
+            var removedText  = await AtTheConsole(node, "txtRecords remove host.example.org \"the second\"");
+            var notThere     = await AtTheConsole(node, "txtRecords remove host.example.org \"the third\"");
+
+            Assert.Multiple(() => {
+                Assert.That(removedOne [0], Does.Contain("no longer answers with 2001:db8::1"));
+                Assert.That(removedText[0], Does.Contain("no longer answers with the text \"the second\""));
+                Assert.That(notThere   [0], Does.Contain("nothing was removed"));
+            });
+
+            var aaaa         = await AskFor(node, "host.example.org", 28);
+            var txt          = await AskFor(node, "host.example.org", 16);
+
+            Assert.Multiple(() => {
+                Assert.That(aaaa.Answers.Select(answer => answer.Data), Is.EqualTo(new[] { "2001:db8::2" }));
+                Assert.That(txt. Answers.Select(answer => answer.Data), Is.EqualTo(new[] { "first" }));
+            });
+
+            var removedAll   = await AtTheConsole(node, "aaaaRecords delete host.example.org");
+            var listed       = await AtTheConsole(node, "aaaaRecords");
+            var texts        = await AtTheConsole(node, "txtRecords host.example.org");
+
+            Assert.Multiple(() => {
+                Assert.That(removedAll[0], Does.Contain("2001:db8::2"));
+                Assert.That(listed    [0], Does.StartWith("There is no AAAA record. 'aaaaRecords add <name> <IPv6>' adds one."));
+                Assert.That(texts     [0], Does.StartWith("1 TXT record(s)"));
+                Assert.That(texts     [1], Does.Contain("\"first\""));
+            });
+
+        }
+
+        #endregion
+
+        #region TheOtherTypes_RefuseWhatTheyCannotTake()
+
+        [Test]
+        public async Task TheOtherTypes_RefuseWhatTheyCannotTake()
+        {
+
+            var node = await Started(NewDirectory());
+
+            var ipv4InAAAA   = await AtTheConsole(node, "aaaaRecords add www.example.org 192.0.2.1");
+            var noIPv6       = await AtTheConsole(node, "aaaaRecords add www.example.org 2001:db8::zz");
+            var noText       = await AtTheConsole(node, "txtRecords add www.example.org \"\"");
+            var noTarget     = await AtTheConsole(node, "cnameRecords add docs.example.org bad..name");
+            var sameText     = await AtTheConsole(node, "txtRecords add example.org hello");
+            var again        = await AtTheConsole(node, "txtRecords add example.org. hello");
+            var tooFew       = await AtTheConsole(node, "txtRecords add example.org");
+
+            Assert.Multiple(() => {
+                Assert.That(ipv4InAAAA[0],  Does.Contain("no IPv6 address"));
+                Assert.That(noIPv6    [0],  Does.Contain("no IPv6 address"));
+                Assert.That(noText    [0],  Does.Contain("needs a text"));
+                Assert.That(noTarget  [0],  Does.Contain("no domain name"));
+                Assert.That(sameText  [0],  Does.Contain("answers with the text \"hello\" from now on"));
+                Assert.That(again     [0],  Does.Contain("already"));
+                Assert.That(tooFew    [0],  Does.StartWith("txtRecords add <name> \"<text>\""));
+            });
+
+            Assert.That(node.Records.Count, Is.EqualTo(1));
+
+        }
+
+        #endregion
+
+        #region ALongOrUnicodeText_IsAnsweredAsItIs()
+
+        [Test]
+        public async Task ALongOrUnicodeText_IsAnsweredAsItIs()
+        {
+
+            var directory  = NewDirectory();
+            var first      = await Started(directory);
+
+            // Longer than one character-string of 255 octets: answered in two.
+            var long_      = String.Concat(Enumerable.Repeat("0123456789", 30));
+
+            var addedLong  = await AtTheConsole(first, $"txtRecords add long.example.org {long_}");
+            var addedUTF8  = await AtTheConsole(first, "txtRecords add utf8.example.org \"Grüße aus Jena\"");
+
+            Assert.Multiple(() => {
+                Assert.That(addedLong[0], Does.Contain("from now on"));
+                Assert.That(addedUTF8[0], Does.Contain("from now on"));
+            });
+
+            async Task AnswersAsItIs(DNSServerNode node)
+            {
+
+                var askedLong  = await AskFor(node, "long.example.org", 16, OverTCP: true);
+                var askedUTF8  = await AskFor(node, "utf8.example.org", 16);
+
+                Assert.Multiple(() => {
+                    Assert.That(askedLong.Answers.Select(answer => answer.Data), Is.EqualTo(new[] { long_ }));
+                    Assert.That(askedUTF8.Answers.Select(answer => answer.Data), Is.EqualTo(new[] { "Grüße aus Jena" }));
+                });
+
+            }
+
+            await AnswersAsItIs(first);
+            await AnswersAsItIs(await Restarted(first, directory));
+
+        }
+
+        #endregion
+
+        #region (private) Restarted(Node, Directory)
+
+        /// <summary>
+        /// The node stopped, and another started from the same directory: what
+        /// it answers with is what was written.
+        /// </summary>
+        private async Task<DNSServerNode> Restarted(DNSServerNode  Node,
+                                                    String         Directory)
+        {
+
+            await Node.DisposeAsync();
+            nodes.Remove(Node);
+
+            return await Started(Directory);
 
         }
 

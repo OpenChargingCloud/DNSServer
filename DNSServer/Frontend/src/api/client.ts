@@ -95,30 +95,55 @@ export interface ResourceRecord {
     class:  string;
     /** In seconds. */
     ttl:    number;
-    /** What it answers with, as a zone file writes it: "192.0.2.10". */
+    /** What it answers with, as a zone file writes it: "192.0.2.10", "\"v=spf1 -all\"". */
     data:   string | null;
+    /**
+     * What it answers with, as it is added and removed - the address, the text
+     * unquoted, the name it is an alias of - for A, AAAA, TXT and CNAME
+     * records; null for every other type.
+     */
+    value:  string | null;
     /** The whole record as a zone-file line. */
     line:   string;
 }
 
-/** A new A record: POST /dnsServer/records/a. */
-export interface NewARecord {
-    name:     string;
-    address:  string;
-    /** Seconds, or with s, m, h or d after it - "1h"; left out for the "defaultTTL". */
-    ttl?:     string;
+/** The types of record that are added and removed here; every other type is written into the "dnsServer" section by hand. */
+export const changeableTypes = [ 'A', 'AAAA', 'TXT', 'CNAME' ] as const;
+
+export type ChangeableType = typeof changeableTypes[number];
+
+/** Whether records of the given type are added and removed here. */
+export function isChangeable(Type: string): Type is ChangeableType {
+    return (changeableTypes as readonly string[]).includes(Type);
 }
 
-/** A records taken away: POST /dnsServer/records/a/remove - every one of the name, where no address is given. */
-export interface RemovedARecord {
+/** The key of what a record answers with: "address" for A and AAAA, "text" for TXT, "target" for CNAME. */
+export function keyOf(Type: ChangeableType): 'address' | 'text' | 'target' {
+    return Type === 'TXT' ? 'text' : Type === 'CNAME' ? 'target' : 'address';
+}
+
+/** A new record: POST /dnsServer/records/{type} - { name, address | text | target, ttl? }. */
+export interface NewRecord {
     name:      string;
     address?:  string;
+    text?:     string;
+    target?:   string;
+    /** Seconds, or with s, m, h or d after it - "1h"; left out for the "defaultTTL". */
+    ttl?:      string;
+}
+
+/** Records taken away: POST /dnsServer/records/{type}/remove - every one of the name and type, where nothing else is given. */
+export interface RemovedRecord {
+    name:      string;
+    address?:  string;
+    text?:     string;
+    target?:   string;
 }
 
 /** What a change of the records answers: what it said, and the records as they are now. */
 export interface RecordsChanged {
     said:     string;
-    /** What else changed with it - the TTL of the other A records of the name. */
+    /** What else changed with it - the TTL of the other records of the name and type. */
     note:     string | null;
     records:  ResourceRecord[];
 }
@@ -133,8 +158,8 @@ export const api = {
         status:    ()                       => request<NameServerStatus>   ('GET',  '/dnsServer'),
         settings:  ()                       => request<NameServerSettings> ('GET',  '/dnsServer/settings'),
         records:   ()                       => request<ResourceRecord[]>   ('GET',  '/dnsServer/records'),
-        addA:      (record: NewARecord)     => request<RecordsChanged>     ('POST', '/dnsServer/records/a', record),
-        removeA:   (record: RemovedARecord) => request<RecordsChanged>     ('POST', '/dnsServer/records/a/remove', record)
+        add:       (type: ChangeableType, record: NewRecord)      => request<RecordsChanged>  ('POST', `/dnsServer/records/${type.toLowerCase()}`, record),
+        remove:    (type: ChangeableType, record: RemovedRecord)  => request<RecordsChanged>  ('POST', `/dnsServer/records/${type.toLowerCase()}/remove`, record)
     }
 
 };
