@@ -1,5 +1,7 @@
 # DNSServer
 
+![The EV charging test environment, the DNS server (DNS) highlighted](docs/EVChargingTestEnvironment.svg)
+
 One name server for a local network, as a WWCP node: Hermod's DNS server,
 answering over UDP and TCP with the records of the `dnsServer` section of the
 node's configuration file - and a web interface, a JSON API below
