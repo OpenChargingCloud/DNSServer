@@ -29,15 +29,20 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
     /// <summary>
     /// The records of one type: listed, added and removed - what 'aRecords',
-    /// 'aaaaRecords', 'txtRecords' and 'cnameRecords' have in common.
+    /// 'aaaaRecords', 'txtRecords', 'cnameRecords', 'mxRecords', 'srvRecords'
+    /// and 'ptrRecords' have in common.
     /// </summary>
     /// <remarks>
     /// <code>
     /// xRecords                                   every record of the type
     /// xRecords &lt;name&gt;                            those of one name
     /// xRecords add &lt;name&gt; &lt;data&gt; [&lt;ttl&gt;]        the name answers with it as well
-    /// xRecords remove &lt;name&gt; [&lt;data&gt;]            the name no longer answers with it - with any of the type, where none is given
+    /// xRecords remove &lt;name&gt; [&lt;value&gt;]           the name no longer answers with it - with any of the type, where none is given
     /// </code>
+    /// The data is one word - an address, a quoted text, a name - or, for an MX
+    /// or SRV record, as many as a zone file writes: "10 mail.example.org". A
+    /// record is removed by what tells it from the others of its name: the
+    /// address, the text, or the name an MX, SRV or PTR record points to.
     /// A name is complete, with or without its trailing dot. A TTL is a number
     /// of seconds, or one with s, m, h or d after it; without one, the
     /// "defaultTTL" of the "dnsServer" section. Data with spaces in it - a
@@ -50,12 +55,18 @@ namespace cloud.charging.open.DNSServer.CommandLine
     /// <param name="Name">The name this is typed as.</param>
     /// <param name="DataWord">What the data is called in the help: "IPv4", "\"text\"".</param>
     /// <param name="Example">The name and data of an example: "www.example.org 192.0.2.10".</param>
+    /// <param name="DataWords">How many words the data is: 1, 2 for an MX record, 4 for an SRV record.</param>
+    /// <param name="ValueWord">What a record is removed by, in the help: the data word by default.</param>
+    /// <param name="ValueExample">The name and value of an example of removing one: the example by default.</param>
     public abstract class TypedRecordsCommand(DNSServerCLI            CLI,
                                               DNSResourceRecordTypes  Type,
                                               String                  Name,
                                               String                  DataWord,
-                                              String                  Example) : ACLICommand<DNSServerCLI>(CLI),
-                                                                                 ICLICommand
+                                              String                  Example,
+                                              Int32                   DataWords     = 1,
+                                              String?                 ValueWord     = null,
+                                              String?                 ValueExample  = null) : ACLICommand<DNSServerCLI>(CLI),
+                                                                                              ICLICommand
     {
 
         #region Data
@@ -153,7 +164,8 @@ namespace cloud.charging.open.DNSServer.CommandLine
         private String[] Added(String[] Arguments)
         {
 
-            if (Arguments.Length is < 4 or > 5)
+            // xRecords add <name> <data words> [<ttl>]
+            if (Arguments.Length < 3 + DataWords || Arguments.Length > 4 + DataWords)
                 return [ $"{Name} add <name> {DataWord} [<ttl>] - e.g. '{Name} add {Example} 1h'" ];
 
             if (!cli.MayDo(Permission.Edit(DNSServerAccess.NameServer), Name, out var refused))
@@ -161,8 +173,8 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
             var change = cli.DNSServer.Add(Type,
                                            Arguments[2],
-                                           Arguments[3],
-                                           Arguments.Length == 5 ? Arguments[4] : null,
+                                           String.Join(" ", Arguments[3..(3 + DataWords)]),
+                                           Arguments.Length == 4 + DataWords ? Arguments[^1] : null,
                                            cli.Caller.ToString());
 
             return change.Note is not null
@@ -179,7 +191,7 @@ namespace cloud.charging.open.DNSServer.CommandLine
         {
 
             if (Arguments.Length is < 3 or > 4)
-                return [ $"{Name} remove <name> [{DataWord}] - e.g. '{Name} remove {Example}'" ];
+                return [ $"{Name} remove <name> [{ValueWord ?? DataWord}] - e.g. '{Name} remove {ValueExample ?? Example}'" ];
 
             if (!cli.MayDo(Permission.Edit(DNSServerAccess.NameServer), Name, out var refused))
                 return [ refused ];
@@ -208,9 +220,12 @@ namespace cloud.charging.open.DNSServer.CommandLine
         /// </summary>
         protected virtual String DataOf(IDNSResourceRecord Record)
 
-            => Record is TXT txt
-                   ? $"\"{txt.Text}\""
-                   : ResourceRecords.ValueOf(Record) ?? "";
+            => Record switch {
+                   TXT txt  => $"\"{txt.Text}\"",
+                   MX  mx   => $"{mx.Preference} {mx.Exchange.FullName}",
+                   SRV srv  => $"{srv.Priority} {srv.Weight} {srv.Port.ToUInt16()} {srv.Target.FullName}",
+                   _        => ResourceRecords.ValueOf(Record) ?? ""
+               };
 
         #endregion
 
@@ -226,7 +241,7 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
         public override String Help()
 
-            => $"{Name} [<name> | add <name> {DataWord} [<ttl>] | remove <name> [{DataWord}]] - the {TypeName} records of the name server: " +
+            => $"{Name} [<name> | add <name> {DataWord} [<ttl>] | remove <name> [{ValueWord ?? DataWord}]] - the {TypeName} records of the name server: " +
                 "listed, added, removed";
 
         #endregion

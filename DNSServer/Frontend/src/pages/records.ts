@@ -1,4 +1,4 @@
-import { api, changeableTypes, isChangeable, keyOf, type ChangeableType, type NewRecord, type RecordsChanged, type ResourceRecord } from '../api/client';
+import { api, changeableTypes, isChangeable, keyOf, numbersOf, type ChangeableType, type NewRecord, type RecordNumber, type RecordsChanged, type ResourceRecord } from '../api/client';
 import { auth } from '../auth';
 import type { Page } from '@node/router';
 import { mayButNot, reloadButton, shell } from '@node/shell';
@@ -8,12 +8,12 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
 
 /**
  * The records the name server answers with: every one of them, of every type,
- * and the A, AAAA, TXT and CNAME records added and removed here.
+ * and the A, AAAA, TXT, CNAME, MX, SRV and PTR records added and removed here.
  *
  * Every change is sent at once and is in effect at once - answered from then
  * on, and written to the configuration file - and the page draws the records
  * as the node answers with them, not as they were sent. A record of another
- * type - MX, SRV - is written into the "dnsServer" section by hand, and is
+ * type - CAA, NAPTR - is written into the "dnsServer" section by hand, and is
  * listed here from the next start on.
  */
 export const recordsPage: Page = {
@@ -121,8 +121,16 @@ export const recordsPage: Page = {
         }
 
 
+        /** What each number of an MX or SRV record is called, an example, and what to know. */
+        const numbers: Record<RecordNumber, { label: string; placeholder: string; hint: string }> = {
+            preference:  { label: 'Preference', placeholder: '10',  hint: 'The lowest is tried first.' },
+            priority:    { label: 'Priority',   placeholder: '0',   hint: 'The lowest is tried first.' },
+            weight:      { label: 'Weight',     placeholder: '5',   hint: 'Among those of one priority, how often each is chosen.' },
+            port:        { label: 'Port',       placeholder: '443', hint: 'Where the service listens on the target.' }
+        };
+
         /** What the form asks for, for each type: what the data is called, an example, and what to know. */
-        const asked: Record<ChangeableType, { label: string; placeholder: string; inputmode: string; hint: string }> = {
+        const asked: Record<ChangeableType, { label: string; placeholder: string; inputmode: string; hint: string; name?: string }> = {
             A:      { label:        'IPv4 address',
                       placeholder:  '192.0.2.10',
                       inputmode:    'decimal',
@@ -140,7 +148,22 @@ export const recordsPage: Page = {
                       placeholder:  'www.example.org',
                       inputmode:    'text',
                       hint:         'The name this one is an alias of, complete. A name with a CNAME has no other record, ' +
-                                    'and one CNAME only.' }
+                                    'and one CNAME only.' },
+            MX:     { label:        'Mail exchange',
+                      placeholder:  'mail.example.org',
+                      inputmode:    'text',
+                      hint:         'The host that takes the mail of the name: a name with an A or AAAA record, not an address.',
+                      name:         'example.org' },
+            SRV:    { label:        'Target',
+                      placeholder:  'csms.example.org',
+                      inputmode:    'text',
+                      hint:         'The host the service is on: a name with an A or AAAA record.',
+                      name:         '_ocpp._tcp.example.org' },
+            PTR:    { label:        'Points to',
+                      placeholder:  'www.example.org',
+                      inputmode:    'text',
+                      hint:         'The name the address - or the name - points to, complete.',
+                      name:         '192.0.2.10' }
         };
 
 
@@ -165,9 +188,21 @@ export const recordsPage: Page = {
 
                         <label>Name
                             <input type="text" name="name" required autocomplete="off" spellcheck="false"
-                                   placeholder="www.example.org" ?disabled=${!mayChange} />
-                            <span class="hint">Complete, with or without its trailing dot.</span>
+                                   placeholder="${ask.name ?? 'www.example.org'}" ?disabled=${!mayChange} />
+                            <span class="hint" id="add-record-name-hint">${picked === 'PTR'
+                                ? 'Complete, with or without its trailing dot - or an IPv4 or IPv6 address, for the name it is looked up by: 192.0.2.10 is 10.2.0.192.in-addr.arpa.'
+                                : picked === 'SRV'
+                                      ? 'The name of the service, complete: _service._protocol and the domain.'
+                                      : 'Complete, with or without its trailing dot.'}</span>
                         </label>
+
+                        ${numbersOf(picked).map(number => html`
+                            <label>${numbers[number].label}
+                                <input type="number" name="${number}" required min="${number === 'port' ? 1 : 0}" max="65535" step="1"
+                                       placeholder="${numbers[number].placeholder}" ?disabled=${!mayChange} />
+                                <span class="hint">${numbers[number].hint}</span>
+                            </label>
+                        `)}
 
                         <label><span id="add-record-data-label">${ask.label}</span>
                             <input type="text" name="data" required autocomplete="off" spellcheck="false"
@@ -223,6 +258,9 @@ export const recordsPage: Page = {
             const ttl     = field(form, 'ttl');
 
             const record: NewRecord = { name, [keyOf(type)]: data };
+
+            for (const number of numbersOf(type))
+                record[number] = Number(field(form, number));
 
             if (ttl.length > 0)
                 record.ttl = ttl;

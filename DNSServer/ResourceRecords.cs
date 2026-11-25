@@ -83,8 +83,22 @@ namespace cloud.charging.open.DNSServer
                                                                                         DNSResourceRecordTypes.A,
                                                                                         DNSResourceRecordTypes.AAAA,
                                                                                         DNSResourceRecordTypes.TXT,
-                                                                                        DNSResourceRecordTypes.CNAME
+                                                                                        DNSResourceRecordTypes.CNAME,
+                                                                                        DNSResourceRecordTypes.MX,
+                                                                                        DNSResourceRecordTypes.SRV,
+                                                                                        DNSResourceRecordTypes.PTR
                                                                                     ];
+
+        /// <summary>
+        /// The types of record that answer with a name - and are removed by
+        /// it: the mail exchange of an MX record, the target of an SRV or PTR
+        /// record.
+        /// </summary>
+        public static readonly IReadOnlyList<DNSResourceRecordTypes>  RemovedByName  = [
+                                                                                           DNSResourceRecordTypes.MX,
+                                                                                           DNSResourceRecordTypes.SRV,
+                                                                                           DNSResourceRecordTypes.PTR
+                                                                                       ];
 
         #endregion
 
@@ -276,8 +290,8 @@ namespace cloud.charging.open.DNSServer
         #region TryAdd(Record, out Note, out Error, out NotSaved)
 
         /// <summary>
-        /// One record more - an A, AAAA, TXT or CNAME record: its name answers
-        /// with it as well.
+        /// One record more - an A, AAAA, TXT, CNAME, MX, SRV or PTR record: its
+        /// name answers with it as well.
         /// </summary>
         /// <remarks>
         /// <para>
@@ -447,6 +461,43 @@ namespace cloud.charging.open.DNSServer
         #endregion
 
 
+        #region (static) TryReverseName(Text, out Name)
+
+        /// <summary>
+        /// The name an address is looked up by, where the text is an address:
+        /// "10.2.0.192.in-addr.arpa." for 192.0.2.10 (RFC 1035 §3.5), and the
+        /// nibbles of an IPv6 address backwards below "ip6.arpa." (RFC 3596
+        /// §2.5).
+        /// </summary>
+        public static Boolean TryReverseName(String                                Text,
+                                             [NotNullWhen(true)] out DomainName?   Name)
+        {
+
+            Name = null;
+
+            var text = Text.Trim();
+
+            // Four numbers of an IPv4 address, or an IPv6 address - and not
+            // "10", which .NET would read as 0.0.0.10.
+            var isIPv4 = text.Count(c => c == '.') == 3 && text.All(c => c == '.' || Char.IsAsciiDigit(c));
+            var isIPv6 = text.Contains(':');
+
+            if (!(isIPv4 || isIPv6) ||
+                !System.Net.IPAddress.TryParse(text, out var address))
+                return false;
+
+            var bytes = address.GetAddressBytes();
+
+            var reverse = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                              ? String.Join(".", bytes.Reverse().Select(octet => octet.ToString(System.Globalization.CultureInfo.InvariantCulture))) + ".in-addr.arpa."
+                              : String.Join(".", bytes.Reverse().SelectMany(octet => new[] { octet & 0x0F, octet >> 4 }).Select(nibble => nibble.ToString("x"))) + ".ip6.arpa.";
+
+            return DomainName.TryParseLenient(reverse, out Name, out _);
+
+        }
+
+        #endregion
+
         #region (static) TryParseName(Text, out Name, out Error)
 
         /// <summary>
@@ -500,9 +551,10 @@ namespace cloud.charging.open.DNSServer
         #region (static) ValueOf(Record)
 
         /// <summary>
-        /// What a record of a type that can be added and removed here answers
-        /// with, as it was given: the address of an A or AAAA record, the text of
-        /// a TXT record, the name a CNAME points to - null for every other type.
+        /// What a record of a type that can be added and removed here is removed
+        /// by: the address of an A or AAAA record, the text of a TXT record, the
+        /// name a CNAME points to, the mail exchange of an MX record, the target
+        /// of an SRV or PTR record - null for every other type.
         /// </summary>
         public static String? ValueOf(IDNSResourceRecord Record)
 
@@ -512,6 +564,9 @@ namespace cloud.charging.open.DNSServer
                    AAAA  aaaa   => DNSTools.ToZoneFileText(aaaa.IPv6Address),
                    TXT   txt    => txt.Text,
                    CNAME cname  => cname.CName.FullName,
+                   MX    mx     => mx.Exchange.FullName,
+                   SRV   srv    => srv.Target.FullName,
+                   PTR   ptr    => ptr.Target.FullName,
                    _            => null
                };
 
@@ -528,6 +583,9 @@ namespace cloud.charging.open.DNSServer
             => Record switch {
                    TXT   txt    => $"the text \"{txt.Text}\"",
                    CNAME cname  => $"an alias of {cname.CName.FullName}",
+                   MX    mx     => $"the mail exchange {mx.Exchange.FullName}, preference {mx.Preference}",
+                   SRV   srv    => $"the service at {srv.Target.FullName} port {srv.Port.ToUInt16()}, priority {srv.Priority}, weight {srv.Weight}",
+                   PTR   ptr    => $"the name {ptr.Target.FullName}",
                    _            => ValueOf(Record) ?? Record.ToZoneFileString()
                };
 
@@ -547,6 +605,13 @@ namespace cloud.charging.open.DNSServer
                    (AAAA  a1, AAAA  a2)  => a1.IPv6Address == a2.IPv6Address,
                    (TXT   t1, TXT   t2)  => t1.Strings.SequenceEqual(t2.Strings, StringComparer.Ordinal),
                    (CNAME c1, CNAME c2)  => Normalized(c1.CName.FullName) == Normalized(c2.CName.FullName),
+                   (MX    m1, MX    m2)  => m1.Preference == m2.Preference &&
+                                            Normalized(m1.Exchange.FullName) == Normalized(m2.Exchange.FullName),
+                   (SRV   s1, SRV   s2)  => s1.Priority == s2.Priority &&
+                                            s1.Weight   == s2.Weight   &&
+                                            s1.Port     == s2.Port     &&
+                                            Normalized(s1.Target.FullName) == Normalized(s2.Target.FullName),
+                   (PTR   p1, PTR   p2)  => Normalized(p1.Target.FullName) == Normalized(p2.Target.FullName),
                    _                     => Record1.Type == Record2.Type &&
                                             Record1.ToZoneFileString() == Record2.ToZoneFileString()
                };
@@ -567,6 +632,9 @@ namespace cloud.charging.open.DNSServer
                    AAAA  aaaa   => new AAAA (aaaa. DomainName, aaaa. Class, TTL, aaaa.IPv6Address),
                    TXT   txt    => new TXT  (txt.  DomainName, txt.  Class, TTL, txt.Strings),
                    CNAME cname  => new CNAME(DomainName.ParseLenient(cname.DomainName.FullName), cname.Class, TTL, cname.CName),
+                   MX    mx     => new MX   (DomainName.ParseLenient(mx.   DomainName.FullName), mx.   Class, TTL, mx.Preference, mx.Exchange),
+                   SRV   srv    => new SRV  (srv.  DomainName, srv.  Class, TTL, srv.Priority, srv.Weight, srv.Port, srv.Target),
+                   PTR   ptr    => new PTR  (ptr.  DomainName, ptr.  Class, TTL, ptr.Target),
                    _            => Record
                };
 

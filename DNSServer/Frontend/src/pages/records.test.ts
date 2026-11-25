@@ -2,10 +2,12 @@
  * The records page drawn, in a document of happy-dom, against a stand-in DNS
  * server that keeps what it is sent: an A record added - with a TTL and
  * without - a TXT record with its text as it was typed, a CNAME with the name
- * it is an alias of, what was typed kept when another type is picked, records
- * removed after asking, what the server refused said beside the form with
- * what was typed kept, records of other types listed without a way to remove
- * them, and for whoever may only look, nothing that changes anything.
+ * it is an alias of, an MX and an SRV record with their numbers, a PTR record
+ * for an address, what was typed kept when another type is picked, records
+ * removed after asking - an MX record by its mail exchange - what the server
+ * refused said beside the form with what was typed kept, records of other
+ * types listed without a way to remove them, and for whoever may only look,
+ * nothing that changes anything.
  */
 
 import { asked, change, field, open, refused, said, submit, type, until, type Asked } from '../../test/dnsServer.ts';
@@ -32,25 +34,31 @@ function asRecord(Record: Kept): Record<string, unknown> {
         class:  'IN',
         ttl:    Record.ttl,
         data:   dataOf(Record),
-        value:  [ 'A', 'AAAA', 'TXT', 'CNAME' ].includes(Record.type) ? Record.value : null,
+        // What it is removed by: an MX or SRV record by the name it ends with.
+        value:  [ 'A', 'AAAA', 'TXT', 'CNAME', 'PTR' ].includes(Record.type) ? Record.value
+              : [ 'MX', 'SRV' ].includes(Record.type)                         ? Record.value.split(' ').at(-1)!
+              : null,
         line:   `${Record.name} ${Record.ttl} IN ${Record.type} ${dataOf(Record)}`
     };
 }
 
-const keys: Record<string, string> = { a: 'address', aaaa: 'address', txt: 'text', cname: 'target' };
+const keys: Record<string, string> = { a: 'address', aaaa: 'address', txt: 'text', cname: 'target', mx: 'exchange', srv: 'target', ptr: 'target' };
+
+/** The numbers an MX or SRV record is sent with, before its name. */
+const numbers: Record<string, string[]> = { mx: [ 'preference' ], srv: [ 'priority', 'weight', 'port' ] };
 
 function dnsServer({ method, path, body }: Asked): unknown {
 
     if (method === 'GET' && path === '/dnsServer/records')
         return records.map(asRecord);
 
-    const added = /^\/dnsServer\/records\/(a|aaaa|txt|cname)$/.exec(path);
+    const added = /^\/dnsServer\/records\/(a|aaaa|txt|cname|mx|srv|ptr)$/.exec(path);
 
     if (method === 'ADD' && added !== null) {
 
         const kind  = added[1]!;
         const sent  = body as Record<string, string>;
-        const value = sent[keys[kind]!]!;
+        const value = [ ...(numbers[kind] ?? []).map(number => String(sent[number])), sent[keys[kind]!]! ].join(' ');
 
         if (kind === 'a' && !/^\d+\.\d+\.\d+\.\d+$/.test(value))
             return refused(400, `'${value}' is no IPv4 address.`);
@@ -63,7 +71,7 @@ function dnsServer({ method, path, body }: Asked): unknown {
 
     }
 
-    const removed = /^\/dnsServer\/records\/(a|aaaa|txt|cname)$/.exec(path);
+    const removed = /^\/dnsServer\/records\/(a|aaaa|txt|cname|mx|srv|ptr)$/.exec(path);
 
     if (method === 'REMOVE' && removed !== null) {
 
@@ -71,7 +79,7 @@ function dnsServer({ method, path, body }: Asked): unknown {
         const sent  = body as Record<string, string>;
         const value = sent[keys[removed[1]!]!];
 
-        records = records.filter(record => !(record.type === kind && record.name === sent.name && (value === undefined || record.value === value)));
+        records = records.filter(record => !(record.type === kind && record.name === sent.name && (value === undefined || asRecord(record).value === value)));
 
         return { said: `${sent.name} no longer answers with ${value}.`, note: null, records: records.map(asRecord) };
 
@@ -179,6 +187,90 @@ describe('the records', () => {
 
     });
 
+    it('adds an MX record with its preference, and an SRV record with its priority, weight and port - as numbers', async () => {
+
+        records = [];
+
+        const root = await open(recordsPage, '/dnsServer/records', mayEdit,
+                                dnsServer, root => root.querySelector('#add-record') !== null);
+
+        change(field<HTMLSelectElement>(root, '#add-record', 'type'), 'MX');
+
+        await until(() => root.querySelector('#add-record-data-label')!.textContent === 'Mail exchange', 'the form does not ask for a mail exchange');
+
+        assert.equal(root.querySelector('#add-record input[name="priority"]'), null, 'an MX record asked for a priority');
+
+        type(field(root, '#add-record', 'name'),       'example.org');
+        type(field(root, '#add-record', 'preference'), '10');
+        type(field(root, '#add-record', 'data'),       'mail.example.org');
+        submit(root, '#add-record');
+
+        await until(() => root.querySelector('tr[data-record^="example.org."]') !== null, 'the MX record was not drawn');
+
+        change(field<HTMLSelectElement>(root, '#add-record', 'type'), 'SRV');
+
+        await until(() => root.querySelector('#add-record input[name="port"]') !== null, 'the form does not ask for a port');
+
+        type(field(root, '#add-record', 'name'),     '_ocpp._tcp.example.org');
+        type(field(root, '#add-record', 'priority'), '0');
+        type(field(root, '#add-record', 'weight'),   '5');
+        type(field(root, '#add-record', 'port'),     '443');
+        type(field(root, '#add-record', 'data'),     'csms.example.org');
+        submit(root, '#add-record');
+
+        await until(() => sent().length === 2, 'the SRV record was not sent');
+
+        assert.deepEqual(sent(), [
+            { method: 'ADD', path: '/dnsServer/records/mx',  body: { name: 'example.org', exchange: 'mail.example.org', preference: 10 } },
+            { method: 'ADD', path: '/dnsServer/records/srv', body: { name: '_ocpp._tcp.example.org', target: 'csms.example.org', priority: 0, weight: 5, port: 443 } }
+        ]);
+
+        await until(() => root.querySelector('tr[data-record^="_ocpp._tcp.example.org."]') !== null, 'the SRV record was not drawn');
+
+        assert.match(root.querySelector('tr[data-record^="_ocpp._tcp.example.org."] .record-data')!.textContent!, /^0 5 443 csms\.example\.org$/);
+
+    });
+
+    it('says that a PTR record may be added for an address', async () => {
+
+        records = [];
+
+        const root = await open(recordsPage, '/dnsServer/records', mayEdit,
+                                dnsServer, root => root.querySelector('#add-record') !== null);
+
+        change(field<HTMLSelectElement>(root, '#add-record', 'type'), 'PTR');
+
+        await until(() => root.querySelector('#add-record-data-label')!.textContent === 'Points to', 'the form does not ask what it points to');
+
+        assert.match(root.querySelector('#add-record-name-hint')!.textContent!, /10\.2\.0\.192\.in-addr\.arpa/);
+        assert.equal(field(root, '#add-record', 'name').placeholder, '192.0.2.10');
+
+        type(field(root, '#add-record', 'name'), '192.0.2.10');
+        type(field(root, '#add-record', 'data'), 'www.example.org');
+        submit(root, '#add-record');
+
+        await until(() => sent().length === 1, 'nothing was sent');
+
+        assert.deepEqual(sent()[0], { method: 'ADD', path: '/dnsServer/records/ptr', body: { name: '192.0.2.10', target: 'www.example.org' } });
+
+    });
+
+    it('removes an MX record by its mail exchange', async () => {
+
+        records = [ { name: 'example.org.', type: 'MX', ttl: 3600, value: '10 mail.example.org.' },
+                    { name: 'example.org.', type: 'MX', ttl: 3600, value: '20 backup.example.org.' } ];
+
+        const root = await open(recordsPage, '/dnsServer/records', mayEdit,
+                                dnsServer, root => root.querySelectorAll('tr[data-record]').length === 2);
+
+        root.querySelector<HTMLButtonElement>('button[data-remove="example.org. MX backup.example.org."]')!.click();
+
+        await until(() => root.querySelectorAll('tr[data-record]').length === 1, 'the record was not removed');
+
+        assert.deepEqual(sent(), [ { method: 'REMOVE', path: '/dnsServer/records/mx', body: { name: 'example.org.', exchange: 'backup.example.org.' } } ]);
+
+    });
+
     it('says what the server refused, and keeps what was typed', async () => {
 
         records = [];
@@ -202,13 +294,13 @@ describe('the records', () => {
         records = [ { name: 'host.example.org.', type: 'A',    ttl: 300,  value: '192.0.2.1' },
                     { name: 'host.example.org.', type: 'A',    ttl: 300,  value: '192.0.2.2' },
                     { name: 'mail.example.org.', type: 'AAAA', ttl: 3600, value: '2001:db8::25' },
-                    { name: 'example.org.',      type: 'MX',   ttl: 3600, value: '10 mail.example.org.' } ];
+                    { name: 'example.org.',      type: 'CAA',  ttl: 3600, value: '0 issue "letsencrypt.org"' } ];
 
         const root = await open(recordsPage, '/dnsServer/records', mayEdit,
                                 dnsServer, root => root.querySelectorAll('tr[data-record]').length === 4);
 
         assert.notEqual(root.querySelector('tr[data-record^="mail.example.org."] button'), null, 'an AAAA record cannot be removed here');
-        assert.equal   (root.querySelector('tr[data-record^="example.org."] button'),      null, 'an MX record can be removed here');
+        assert.equal   (root.querySelector('tr[data-record^="example.org."] button'),      null, 'a CAA record can be removed here');
 
         root.querySelector<HTMLButtonElement>('button[data-remove="host.example.org. A 192.0.2.1"]')!.click();
 

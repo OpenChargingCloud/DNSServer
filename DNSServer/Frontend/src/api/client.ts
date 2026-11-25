@@ -106,9 +106,9 @@ export interface ResourceRecord {
     /** What it answers with, as a zone file writes it: "192.0.2.10", "\"v=spf1 -all\"". */
     data:   string | null;
     /**
-     * What it answers with, as it is added and removed - the address, the text
-     * unquoted, the name it is an alias of - for A, AAAA, TXT and CNAME
-     * records; null for every other type.
+     * What it is removed by - the address, the text unquoted, the name it is an
+     * alias of, the mail exchange of an MX record, the target of an SRV or PTR
+     * record; null for every other type.
      */
     value:  string | null;
     /** The whole record as a zone-file line. */
@@ -116,7 +116,7 @@ export interface ResourceRecord {
 }
 
 /** The types of record that are added and removed here; every other type is written into the "dnsServer" section by hand. */
-export const changeableTypes = [ 'A', 'AAAA', 'TXT', 'CNAME' ] as const;
+export const changeableTypes = [ 'A', 'AAAA', 'TXT', 'CNAME', 'MX', 'SRV', 'PTR' ] as const;
 
 export type ChangeableType = typeof changeableTypes[number];
 
@@ -125,27 +125,55 @@ export function isChangeable(Type: string): Type is ChangeableType {
     return (changeableTypes as readonly string[]).includes(Type);
 }
 
-/** The key of what a record answers with: "address" for A and AAAA, "text" for TXT, "target" for CNAME. */
-export function keyOf(Type: ChangeableType): 'address' | 'text' | 'target' {
-    return Type === 'TXT' ? 'text' : Type === 'CNAME' ? 'target' : 'address';
+/**
+ * The key of what a record is removed by - and, but for the numbers of MX and
+ * SRV, all it answers with: "address" for A and AAAA, "text" for TXT,
+ * "exchange" for MX, "target" for CNAME, SRV and PTR.
+ */
+export function keyOf(Type: ChangeableType): 'address' | 'text' | 'target' | 'exchange' {
+    switch (Type) {
+        case 'TXT':   return 'text';
+        case 'MX':    return 'exchange';
+        case 'CNAME':
+        case 'SRV':
+        case 'PTR':   return 'target';
+        default:      return 'address';
+    }
 }
 
-/** A new record: ADD /dnsServer/records/{type} - { name, address | text | target, ttl? }. */
+/** The numbers a record of the type carries before its name, as a zone file writes them. */
+export type RecordNumber = 'preference' | 'priority' | 'weight' | 'port';
+
+/** The numbers of each type: the preference of an MX record; the priority, weight and port of an SRV record. */
+export function numbersOf(Type: ChangeableType): RecordNumber[] {
+    return Type === 'MX'  ? [ 'preference' ]
+         : Type === 'SRV' ? [ 'priority', 'weight', 'port' ]
+         : [];
+}
+
+/** A new record: ADD /dnsServer/records/{type} - { name, address | text | target | exchange, its numbers, ttl? }. */
 export interface NewRecord {
-    name:      string;
-    address?:  string;
-    text?:     string;
-    target?:   string;
+    /** Complete; for a PTR record an IPv4 or IPv6 address as well. */
+    name:         string;
+    address?:     string;
+    text?:        string;
+    target?:      string;
+    exchange?:    string;
+    preference?:  number;
+    priority?:    number;
+    weight?:      number;
+    port?:        number;
     /** Seconds, or with s, m, h or d after it - "1h"; left out for the "defaultTTL". */
-    ttl?:      string;
+    ttl?:         string;
 }
 
 /** Records taken away: REMOVE /dnsServer/records/{type} - every one of the name and type, where nothing else is given. */
 export interface RemovedRecord {
-    name:      string;
-    address?:  string;
-    text?:     string;
-    target?:   string;
+    name:       string;
+    address?:   string;
+    text?:      string;
+    target?:    string;
+    exchange?:  string;
 }
 
 /** What a change of the records answers: what it said, and the records as they are now. */

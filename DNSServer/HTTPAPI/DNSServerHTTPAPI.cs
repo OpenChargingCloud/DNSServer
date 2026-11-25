@@ -42,17 +42,20 @@ namespace cloud.charging.open.DNSServer
     ///   <item>GET  /api/v1/dnsServer                  - how the name server stands: where it listens, how many records it answers with, and how much it answered.</item>
     ///   <item>GET  /api/v1/dnsServer/settings         - the "dnsServer" section as it is in effect, the switches of this start included.</item>
     ///   <item>GET  /api/v1/dnsServer/records                 - every record: its name, type, class, TTL, data and value, and its zone-file line.</item>
-    ///   <item>ADD    /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target", "ttl"? }: the name answers with the record as well - answered with { "said", "note", "records" }.</item>
-    ///   <item>REMOVE /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target"? }: the name no longer answers with the record, or with any of the type - answered with { "said", "records" }.</item>
+    ///   <item>ADD    /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target" | "preference" and "exchange" | "priority", "weight", "port" and "target", "ttl"? }: the name answers with the record as well - answered with { "said", "note", "records" }.</item>
+    ///   <item>REMOVE /api/v1/dnsServer/records/{type}        - { "name", "address" | "text" | "target" | "exchange"? }: the name no longer answers with the record, or with any of the type - answered with { "said", "records" }.</item>
     ///   <item>GET    /api/v1/dnsServer/zones                 - every zone the name server is authoritative for: its name, name servers, hostmaster, serial and timers, the SOA and NS records it makes, and a "note" on what it lacks.</item>
     ///   <item>ADD    /api/v1/dnsServer/zones                 - { "name", "nameServers"? }: the name server is authoritative for the zone from now on - answered with { "said", "note", "zones" }.</item>
     ///   <item>REMOVE /api/v1/dnsServer/zones                 - { "name" }: it no longer is; its records stay - answered with { "said", "zones" }.</item>
     ///   <item>GET    /api/v1/dnsServer/ssh                   - DNS over SSH, the DNS clients with their keys, and what each login asked over SSH since the start.</item>
     ///   <item>PUT    /api/v1/dnsServer/ssh                   - { "enabled"?, "clients"?: [ { "name", "keys", "enabled" } ] }: DNS over SSH, and who may ask there - answered as GET.</item>
     /// </list>
-    /// {type} is a, aaaa, txt or cname; A and AAAA records carry an "address",
-    /// TXT records a "text", taken as it is, and a CNAME the "target" it is an
-    /// alias of.
+    /// {type} is a, aaaa, txt, cname, mx, srv or ptr; A and AAAA records carry
+    /// an "address", TXT records a "text", taken as it is, a CNAME the "target"
+    /// it is an alias of, an MX record its "preference" and "exchange", an SRV
+    /// record its "priority", "weight", "port" and "target", and a PTR record
+    /// the "target" it points to - its "name" may be an address. An MX record
+    /// is removed by its "exchange", an SRV or PTR record by its "target".
     /// A change is in effect at once and written to the configuration file;
     /// one that could not be written is not in effect either.
     /// </remarks>
@@ -356,15 +359,32 @@ namespace cloud.charging.open.DNSServer
 
         /// <summary>
         /// The key of the JSON object that carries what a record of the given
-        /// type answers with: "address" for A and AAAA, "text" for TXT,
-        /// "target" for CNAME.
+        /// type is removed by - and, but for MX and SRV, all it answers with:
+        /// "address" for A and AAAA, "text" for TXT, "exchange" for MX, and
+        /// "target" for CNAME, SRV and PTR.
         /// </summary>
         public static String KeyOf(DNSResourceRecordTypes Type)
 
             => Type switch {
                    DNSResourceRecordTypes.TXT    => "text",
                    DNSResourceRecordTypes.CNAME  => "target",
+                   DNSResourceRecordTypes.MX     => "exchange",
+                   DNSResourceRecordTypes.SRV    => "target",
+                   DNSResourceRecordTypes.PTR    => "target",
                    _                             => "address"
+               };
+
+        /// <summary>
+        /// The numbers a record of the given type carries before its name, in
+        /// the order a zone file writes them: "preference" of an MX record;
+        /// "priority", "weight" and "port" of an SRV record.
+        /// </summary>
+        public static IReadOnlyList<String> NumbersOf(DNSResourceRecordTypes Type)
+
+            => Type switch {
+                   DNSResourceRecordTypes.MX   => [ "preference" ],
+                   DNSResourceRecordTypes.SRV  => [ "priority", "weight", "port" ],
+                   _                           => []
                };
 
         #endregion
@@ -387,6 +407,26 @@ namespace cloud.charging.open.DNSServer
             if (!TryText(json, "name",        true, true,                                 out var name, out var problem) ||
                 !TryText(json, KeyOf(Type),   true, Type != DNSResourceRecordTypes.TXT,   out var data, out problem))
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, problem));
+
+            // An MX or SRV record as a zone file writes it: the numbers, then the name.
+            var numbers = new List<String>();
+
+            foreach (var key in NumbersOf(Type))
+            {
+
+                if (json[key] is not JToken number || number.Type == JTokenType.Null)
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, $"\"{key}\" is missing."));
+
+                if (number.Type is not (JTokenType.Integer or JTokenType.String) ||
+                    !UInt16.TryParse(number.ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out _))
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, $"\"{key}\" is a number from 0 to 65535."));
+
+                numbers.Add(number.ToString());
+
+            }
+
+            if (numbers.Count > 0)
+                data = String.Join(" ", [ .. numbers, data! ]);
 
             // A number of seconds, or the text the command line takes: "1h".
             String? ttl = null;

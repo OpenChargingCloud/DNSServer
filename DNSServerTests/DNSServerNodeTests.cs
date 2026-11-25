@@ -282,7 +282,9 @@ namespace cloud.charging.open.DNSServer.Tests
                 (i < count ? answers : authority).Add((type, type switch {
                     1  when rdLength ==  4  => new System.Net.IPAddress(response.AsSpan(offset, 4)). ToString(),
                     28 when rdLength == 16  => new System.Net.IPAddress(response.AsSpan(offset, 16)).ToString(),
-                    2 or 5                  => NameAt(response, ref rdata),
+                    2 or 5 or 12            => NameAt(response, ref rdata),
+                    15                      => MXAt (response, rdata),
+                    33                      => SRVAt(response, rdata),
                     6                       => SOAAt(response, rdata),
                     16                      => TextAt(response, offset, rdLength),
                     _                       => Convert.ToHexString(response, offset, rdLength)
@@ -293,6 +295,34 @@ namespace cloud.charging.open.DNSServer.Tests
             }
 
             return (flags & 0x000F, (flags & 0x0400) != 0, [ .. answers ], [ .. authority ]);
+
+        }
+
+        /// <summary>
+        /// The data of an MX record as a zone file writes it: "10 mail.example.org.".
+        /// </summary>
+        private static String MXAt(Byte[] Message, Int32 Offset)
+        {
+
+            var preference = BinaryPrimitives.ReadUInt16BigEndian(Message.AsSpan(Offset, 2));
+            var at         = Offset + 2;
+
+            return $"{preference} {NameAt(Message, ref at)}";
+
+        }
+
+        /// <summary>
+        /// The data of an SRV record as a zone file writes it: "0 5 443 csms.example.org.".
+        /// </summary>
+        private static String SRVAt(Byte[] Message, Int32 Offset)
+        {
+
+            var priority  = BinaryPrimitives.ReadUInt16BigEndian(Message.AsSpan(Offset,     2));
+            var weight    = BinaryPrimitives.ReadUInt16BigEndian(Message.AsSpan(Offset + 2, 2));
+            var port      = BinaryPrimitives.ReadUInt16BigEndian(Message.AsSpan(Offset + 4, 2));
+            var at        = Offset + 6;
+
+            return $"{priority} {weight} {port} {NameAt(Message, ref at)}";
 
         }
 
@@ -1023,6 +1053,93 @@ namespace cloud.charging.open.DNSServer.Tests
             nodes.Remove(Node);
 
             return await Started(Directory);
+
+        }
+
+        #endregion
+
+        #region MXSRVAndPTR_AreAnsweredAsAddedAtTheConsole()
+
+        /// <summary>
+        /// The mail exchanges of a name, where a service is, and the name an
+        /// address points to - added at the console, asked for over UDP, kept
+        /// over a restart, and removed by the name they point to.
+        /// </summary>
+        [Test]
+        public async Task MXSRVAndPTR_AreAnsweredAsAddedAtTheConsole()
+        {
+
+            var directory   = NewDirectory();
+            var node        = await Started(directory);
+
+            var mx          = await AtTheConsole(node, "mxRecords add example.org 10 mail.example.org");
+            var mxBackup    = await AtTheConsole(node, "mxRecords add example.org 20 backup.example.org 2h");
+            var srv         = await AtTheConsole(node, "srvRecords add _ocpp._tcp.example.org 0 5 443 csms.example.org");
+            var ptr4        = await AtTheConsole(node, "ptrRecords add 192.0.2.10 www.example.org");
+            var ptr6        = await AtTheConsole(node, "ptrRecords add 2001:db8::10 www.example.org");
+
+            Assert.Multiple(() => {
+                Assert.That(mx,        Has.Some.EqualTo("example.org. answers with the mail exchange mail.example.org., preference 10 from now on, TTL 3600 s."));
+                Assert.That(mxBackup,  Has.Some.StartWith("example.org. answers with the mail exchange backup.example.org., preference 20 from now on, TTL 7200 s.")
+                                       .And.Some.Contains("7200 s"));
+                Assert.That(srv,       Has.Some.EqualTo("_ocpp._tcp.example.org. answers with the service at csms.example.org. port 443, priority 0, weight 5 from now on, TTL 3600 s."));
+                Assert.That(ptr4,      Has.Some.StartWith("10.2.0.192.in-addr.arpa. answers with the name www.example.org."));
+                Assert.That(ptr6,      Has.Some.StartWith("0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa. answers with the name www.example.org."));
+            });
+
+            async Task AnswersAsAdded(DNSServerNode Node)
+            {
+
+                var mxAnswer   = await AskFor(Node, "example.org",                 15);
+                var srvAnswer  = await AskFor(Node, "_ocpp._tcp.example.org",      33, OverTCP: true);
+                var ptrAnswer  = await AskFor(Node, "10.2.0.192.in-addr.arpa",     12);
+                var ptr6Answer = await AskFor(Node, "0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa", 12);
+
+                Assert.Multiple(() => {
+                    Assert.That(mxAnswer.Answers.Select(answer => answer.Data).Order(),  Is.EqualTo(new[] { "10 mail.example.org.", "20 backup.example.org." }));
+                    Assert.That(srvAnswer.Answers.Select(answer => answer.Data),         Is.EqualTo(new[] { "0 5 443 csms.example.org." }));
+                    Assert.That(ptrAnswer.Answers.Select(answer => answer.Data),         Is.EqualTo(new[] { "www.example.org." }));
+                    Assert.That(ptr6Answer.Answers.Select(answer => answer.Data),        Is.EqualTo(new[] { "www.example.org." }));
+                });
+
+            }
+
+            await AnswersAsAdded(node);
+
+            var listed      = await AtTheConsole(node, "mxRecords");
+
+            Assert.That(listed, Has.Some.Contains("10 mail.example.org.").And.Some.Contains("20 backup.example.org."));
+
+            node = await Restarted(node, directory);
+
+            await AnswersAsAdded(node);
+
+            var noNumber    = await AtTheConsole(node, "mxRecords add example.org ten mail.example.org");
+            var anAddress   = await AtTheConsole(node, "mxRecords add example.org 10 192.0.2.25");
+            var noPort      = await AtTheConsole(node, "srvRecords add _sip._udp.example.org 0 5 0 sip.example.org");
+            var tooFew      = await AtTheConsole(node, "srvRecords add _sip._udp.example.org 0 5 sip.example.org");
+            var twice       = await AtTheConsole(node, "mxRecords add example.org 10 mail.example.org");
+
+            Assert.Multiple(() => {
+                Assert.That(noNumber,   Has.Some.StartWith("'ten' is no preference"));
+                Assert.That(anAddress,  Has.Some.StartWith("'192.0.2.25' is an address, and the mail exchange is a name"));
+                Assert.That(noPort,     Has.Some.StartWith("'0' is no port"));
+                Assert.That(tooFew,     Has.Some.StartWith("srvRecords add <name> <priority> <weight> <port> <target> [<ttl>]"));
+                Assert.That(twice,      Has.Some.Contains("already"));
+            });
+
+            var mxGone      = await AtTheConsole(node, "mxRecords remove example.org backup.example.org");
+            var notThere    = await AtTheConsole(node, "srvRecords remove _ocpp._tcp.example.org nothere.example.org");
+            var ptrGone     = await AtTheConsole(node, "ptrRecords remove 192.0.2.10");
+
+            Assert.Multiple(() => {
+                Assert.That(mxGone,     Has.Some.EqualTo("example.org. no longer answers with the mail exchange backup.example.org., preference 20."));
+                Assert.That(notThere,   Has.Some.EqualTo("_ocpp._tcp.example.org. does not answer with the service at nothere.example.org.: nothing was removed."));
+                Assert.That(ptrGone,    Has.Some.EqualTo("10.2.0.192.in-addr.arpa. no longer answers with the name www.example.org.."));
+            });
+
+            Assert.That((await AskFor(node, "example.org", 15)).Answers.Select(answer => answer.Data), Is.EqualTo(new[] { "10 mail.example.org." }));
+            Assert.That((await AskFor(node, "10.2.0.192.in-addr.arpa", 12)).ResponseCode,              Is.EqualTo(3), "NXDOMAIN, with no record left");
 
         }
 

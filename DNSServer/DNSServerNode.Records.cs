@@ -18,6 +18,7 @@
 #region Usings
 
 using System.Text;
+using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Diagnostics.CodeAnalysis;
 
@@ -89,12 +90,13 @@ namespace cloud.charging.open.DNSServer
         /// <summary>
         /// The given name answers with a record of the given type as well, from
         /// now on - as the command line's "aRecords add", "aaaaRecords add",
-        /// "txtRecords add" and "cnameRecords add" and the JSON API's
+        /// "txtRecords add", "cnameRecords add", "mxRecords add", "srvRecords
+        /// add" and "ptrRecords add" and the JSON API's
         /// ADD v1/dnsServer/records/{type} say it.
         /// </summary>
-        /// <param name="Type">A, AAAA, TXT or CNAME.</param>
-        /// <param name="Name">The name, complete; a trailing dot is optional.</param>
-        /// <param name="Data">What it answers with, as it was typed: the IPv4 or IPv6 address, the text, the name it is an alias of.</param>
+        /// <param name="Type">A, AAAA, TXT, CNAME, MX, SRV or PTR.</param>
+        /// <param name="Name">The name, complete; a trailing dot is optional. For a PTR record an IPv4 or IPv6 address as well, for the name it is looked up by.</param>
+        /// <param name="Data">What it answers with, as it was typed - as a zone file writes it: the IPv4 or IPv6 address, the text, the name it is an alias of, "10 mail.example.org" for an MX record, "0 5 443 host.example.org" for an SRV record, the name a PTR record points to.</param>
         /// <param name="TTL">The TTL as it was typed - seconds, or with s, m, h or d after it - or null for the "defaultTTL".</param>
         /// <param name="By">Who added it, for the log.</param>
         public RecordsChange Add(DNSResourceRecordTypes  Type,
@@ -107,7 +109,7 @@ namespace cloud.charging.open.DNSServer
             if (!ResourceRecords.Changeable.Contains(Type))
                 return new ($"A record of the type {ADNSResourceRecord.TypeName(Type)} is written into the \"dnsServer\" section by hand.", null, RecordsChangeOutcome.Refused);
 
-            if (!ResourceRecords.TryParseName(Name, out var domainName, out var error))
+            if (!TryParseOwner(Type, Name, out var domainName, out var error))
                 return new (error, null, RecordsChangeOutcome.Refused);
 
             var ttl = Settings.DefaultTTL;
@@ -141,9 +143,9 @@ namespace cloud.charging.open.DNSServer
         /// line's "... remove" and the JSON API's
         /// REMOVE v1/dnsServer/records/{type} say it.
         /// </summary>
-        /// <param name="Type">A, AAAA, TXT or CNAME.</param>
-        /// <param name="Name">The name, complete; a trailing dot is optional.</param>
-        /// <param name="Data">What the record answers with, as it was typed - the IPv4 or IPv6 address, the text, the name it is an alias of - or null for every record of the type.</param>
+        /// <param name="Type">A, AAAA, TXT, CNAME, MX, SRV or PTR.</param>
+        /// <param name="Name">The name, complete; a trailing dot is optional. For a PTR record an IPv4 or IPv6 address as well.</param>
+        /// <param name="Data">What the record is removed by, as it was typed - the IPv4 or IPv6 address, the text, the name it is an alias of, the mail exchange of an MX record, the target of an SRV or PTR record - or null for every record of the type.</param>
         /// <param name="By">Who removed it, for the log.</param>
         public RecordsChange Remove(DNSResourceRecordTypes  Type,
                                     String                  Name,
@@ -159,7 +161,35 @@ namespace cloud.charging.open.DNSServer
             Func<IDNSResourceRecord, Boolean>? matches = null;
             String?                            said    = null;
 
-            if (!String.IsNullOrEmpty(Data))
+            if (!TryParseOwner(Type, Name, out var owner, out var ownerError))
+                return new (ownerError, null, RecordsChangeOutcome.Refused);
+
+            if (!String.IsNullOrEmpty(Data) && ResourceRecords.RemovedByName.Contains(Type))
+            {
+
+                // An MX, SRV or PTR record is removed by the name it answers
+                // with - the last word, where the whole of its data was given.
+                var words = Data.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                if (words.Length == 0)
+                    return new ("Which name?", null, RecordsChangeOutcome.Refused);
+
+                if (!ResourceRecords.TryParseName(words[^1], out var target, out var targetError))
+                    return new (targetError, null, RecordsChangeOutcome.Refused);
+
+                var wantedName = ResourceRecords.Normalized(target.FullName);
+
+                matches  = record => ResourceRecords.ValueOf(record) is String value &&
+                                     ResourceRecords.Normalized(value) == wantedName;
+                said     = Type switch {
+                               DNSResourceRecordTypes.MX   => $"the mail exchange {target.FullName}",
+                               DNSResourceRecordTypes.SRV  => $"the service at {target.FullName}",
+                               _                           => $"the name {target.FullName}"
+                           };
+
+            }
+
+            else if (!String.IsNullOrEmpty(Data))
             {
 
                 // The record it would be, made with the name and data given, and
@@ -173,13 +203,13 @@ namespace cloud.charging.open.DNSServer
 
             }
 
-            if (!Records.TryRemove(Name, Type, matches, out var removed, out var notSaved))
+            if (!Records.TryRemove(owner.FullName, Type, matches, out var removed, out var notSaved))
                 return new (notSaved, null, RecordsChangeOutcome.NotSaved);
 
             if (removed.Count == 0)
                 return new (said is not null
-                                ? $"{Name} does not answer with {said}: nothing was removed."
-                                : $"{Name} has no {type} record: nothing was removed.",
+                                ? $"{owner.FullName} does not answer with {said}: nothing was removed."
+                                : $"{owner.FullName} has no {type} record: nothing was removed.",
                             null,
                             RecordsChangeOutcome.NothingMatched);
 
@@ -331,6 +361,32 @@ namespace cloud.charging.open.DNSServer
         #endregion
 
 
+        #region (static) TryParseOwner(Type, Name, out Owner, out Error)
+
+        /// <summary>
+        /// The name a record of the given type is made for: as it was typed,
+        /// and for a PTR record an address as well - 192.0.2.10 is
+        /// 10.2.0.192.in-addr.arpa., the name it is looked up by.
+        /// </summary>
+        public static Boolean TryParseOwner(DNSResourceRecordTypes                Type,
+                                            String                                Name,
+                                            [NotNullWhen(true)]  out DomainName?  Owner,
+                                            [NotNullWhen(false)] out String?      Error)
+        {
+
+            if (Type == DNSResourceRecordTypes.PTR &&
+                ResourceRecords.TryReverseName(Name, out Owner))
+            {
+                Error = null;
+                return true;
+            }
+
+            return ResourceRecords.TryParseName(Name, out Owner, out Error);
+
+        }
+
+        #endregion
+
         #region (static) TryMake(Type, Name, Data, TTL, out Record, out Error)
 
         /// <summary>
@@ -408,11 +464,122 @@ namespace cloud.charging.open.DNSServer
                     Record = new CNAME(Name, DNSQueryClasses.IN, TTL, target);
                     return true;
 
+                case DNSResourceRecordTypes.MX:
+                {
+
+                    // "10 mail.example.org": its preference, and the mail exchange.
+                    var words = Data.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                    if (words.Length != 2)
+                    {
+                        Error = "An MX record needs a preference and a mail exchange: '10 mail.example.org'.";
+                        return false;
+                    }
+
+                    if (!UInt16.TryParse(words[0], NumberStyles.None, CultureInfo.InvariantCulture, out var preference))
+                    {
+                        Error = $"'{words[0]}' is no preference: a number from 0 to 65535, the lowest preferred.";
+                        return false;
+                    }
+
+                    if (!TryParseHostName(words[1], "mail exchange", out var exchange, out Error))
+                        return false;
+
+                    Record = new MX(Name, DNSQueryClasses.IN, TTL, preference, exchange);
+                    return true;
+
+                }
+
+                case DNSResourceRecordTypes.SRV:
+                {
+
+                    // "0 5 443 host.example.org": priority, weight, port and target (RFC 2782).
+                    var words = Data.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                    if (words.Length != 4)
+                    {
+                        Error = "An SRV record needs a priority, a weight, a port and a target: '0 5 443 host.example.org'.";
+                        return false;
+                    }
+
+                    if (!UInt16.TryParse(words[0], NumberStyles.None, CultureInfo.InvariantCulture, out var priority))
+                    {
+                        Error = $"'{words[0]}' is no priority: a number from 0 to 65535, the lowest tried first.";
+                        return false;
+                    }
+
+                    if (!UInt16.TryParse(words[1], NumberStyles.None, CultureInfo.InvariantCulture, out var weight))
+                    {
+                        Error = $"'{words[1]}' is no weight: a number from 0 to 65535, among those of one priority.";
+                        return false;
+                    }
+
+                    if (!UInt16.TryParse(words[2], NumberStyles.None, CultureInfo.InvariantCulture, out var port) || port == 0)
+                    {
+                        Error = $"'{words[2]}' is no port: a number from 1 to 65535.";
+                        return false;
+                    }
+
+                    if (!TryParseHostName(words[3], "target", out var srvTarget, out Error))
+                        return false;
+
+                    // An SRV record is owned by a service name: "_ocpp._tcp.example.org.".
+                    Record = new SRV(DNSServiceName.Parse(Name.FullName), DNSQueryClasses.IN, TTL, priority, weight, IPPort.Parse(port), srvTarget);
+                    return true;
+
+                }
+
+                case DNSResourceRecordTypes.PTR:
+                {
+
+                    if (String.IsNullOrWhiteSpace(Data))
+                    {
+                        Error = "A PTR record needs the name it points to.";
+                        return false;
+                    }
+
+                    if (!ResourceRecords.TryParseName(Data, out var pointsTo, out Error))
+                        return false;
+
+                    Record = new PTR(DNSServiceName.Parse(Name.FullName), DNSQueryClasses.IN, TTL, DNSServiceName.Parse(pointsTo.FullName));
+                    return true;
+
+                }
+
                 default:
                     Error = $"A record of the type {ADNSResourceRecord.TypeName(Type)} is written into the \"dnsServer\" section by hand.";
                     return false;
 
             }
+
+        }
+
+        #endregion
+
+
+        #region (private static) TryParseHostName(Text, What, out Name, out Error)
+
+        /// <summary>
+        /// The name of a host an MX or SRV record points to: a name, and no
+        /// address - an MX or SRV record names its host, whose A and AAAA
+        /// records say where it is (RFC 1035 §3.3.9, RFC 2782).
+        /// </summary>
+        private static Boolean TryParseHostName(String                                Text,
+                                                String                                What,
+                                                [NotNullWhen(true)]  out DomainName?  Name,
+                                                [NotNullWhen(false)] out String?      Error)
+        {
+
+            Name = null;
+
+            if (System.Net.IPAddress.TryParse(Text.Trim(), out _) &&
+                (Text.Contains(':') || Text.Count(c => c == '.') == 3))
+            {
+                Error = $"'{Text}' is an address, and the {What} is a name: one with an A or AAAA record.";
+                return false;
+            }
+
+            return ResourceRecords.TryParseName(Text, out Name, out Error);
 
         }
 

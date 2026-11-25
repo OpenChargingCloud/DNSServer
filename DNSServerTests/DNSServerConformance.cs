@@ -237,6 +237,92 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region MX_SRV_AndPTRRecordsAreChangedOverTheJSONAPI()
+
+        /// <summary>
+        /// An MX, an SRV and a PTR record added with the numbers and the name of
+        /// their type - a PTR record for an address - listed as a zone file writes
+        /// them, and removed by the name they point to; a number that is none and
+        /// a missing one refused.
+        /// </summary>
+        [Test]
+        public async Task MX_SRV_AndPTRRecordsAreChangedOverTheJSONAPI()
+        {
+
+            using var http          = await SignedIn();
+
+            var (mx,  mxAnswer)     = await Send(http, ADD,    "api/v1/dnsServer/records/mx",
+                                                 new JObject(new JProperty("name",        "example.org"),
+                                                             new JProperty("preference",  10),
+                                                             new JProperty("exchange",    "mail.example.org")));
+
+            var (srv, srvAnswer)    = await Send(http, ADD,    "api/v1/dnsServer/records/srv",
+                                                 new JObject(new JProperty("name",        "_ocpp._tcp.example.org"),
+                                                             new JProperty("priority",    0),
+                                                             new JProperty("weight",      "5"),
+                                                             new JProperty("port",        443),
+                                                             new JProperty("target",      "csms.example.org")));
+
+            var (ptr, ptrAnswer)    = await Send(http, ADD,    "api/v1/dnsServer/records/ptr",
+                                                 new JObject(new JProperty("name",        "192.0.2.10"),
+                                                             new JProperty("target",      "www.example.org")));
+
+            Assert.Multiple(() => {
+                Assert.That(mx,   Is.EqualTo(HttpStatusCode.OK), mxAnswer. ToString());
+                Assert.That(srv,  Is.EqualTo(HttpStatusCode.OK), srvAnswer.ToString());
+                Assert.That(ptr,  Is.EqualTo(HttpStatusCode.OK), ptrAnswer.ToString());
+            });
+
+            var records             = JArray.Parse(await http.GetStringAsync("api/v1/dnsServer/records"));
+            var byType              = records.ToDictionary(record => record["type"]!.Value<String>()!);
+
+            Assert.Multiple(() => {
+                Assert.That(byType["MX"] ["data"]! .Value<String>(),          Is.EqualTo("10 mail.example.org."));
+                Assert.That(byType["MX"] ["value"]!.Value<String>(),          Is.EqualTo("mail.example.org."));
+                Assert.That(byType["SRV"]["name"]! .Value<String>(),          Is.EqualTo("_ocpp._tcp.example.org."));
+                Assert.That(byType["SRV"]["data"]! .Value<String>(),          Is.EqualTo("0 5 443 csms.example.org."));
+                Assert.That(byType["SRV"]["value"]!.Value<String>(),          Is.EqualTo("csms.example.org."));
+                Assert.That(byType["PTR"]["name"]! .Value<String>(),          Is.EqualTo("10.2.0.192.in-addr.arpa."));
+                Assert.That(byType["PTR"]["value"]!.Value<String>(),          Is.EqualTo("www.example.org."));
+            });
+
+            var (noNumber, why)     = await Send(http, ADD,    "api/v1/dnsServer/records/mx",
+                                                 new JObject(new JProperty("name",        "example.org"),
+                                                             new JProperty("preference",  "ten"),
+                                                             new JProperty("exchange",    "backup.example.org")));
+
+            var (noPort, missing)   = await Send(http, ADD,    "api/v1/dnsServer/records/srv",
+                                                 new JObject(new JProperty("name",        "_sip._udp.example.org"),
+                                                             new JProperty("priority",    0),
+                                                             new JProperty("weight",      5),
+                                                             new JProperty("target",      "sip.example.org")));
+
+            Assert.Multiple(() => {
+                Assert.That(noNumber,                                  Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
+                Assert.That(why.ToString(),                            Does.Contain("\\\"preference\\\" is a number"));
+                Assert.That(noPort,                                    Is.EqualTo(HttpStatusCode.BadRequest), missing.ToString());
+                Assert.That(missing.ToString(),                        Does.Contain("\\\"port\\\" is missing"));
+            });
+
+            foreach (var (type, name, key, value) in new[] { ("mx",  "example.org",             "exchange", "mail.example.org"),
+                                                             ("srv", "_ocpp._tcp.example.org",  "target",   "csms.example.org"),
+                                                             ("ptr", "192.0.2.10",              "target",   "www.example.org") })
+            {
+
+                var (removed, after) = await Send(http, REMOVE, $"api/v1/dnsServer/records/{type}",
+                                                  new JObject(new JProperty("name",  name),
+                                                              new JProperty(key,     value)));
+
+                Assert.That(removed,                                   Is.EqualTo(HttpStatusCode.OK), after.ToString());
+
+            }
+
+            Assert.That(((DNSServerNode) Node).Records.Count,          Is.Zero);
+
+        }
+
+        #endregion
+
         #region TheZonesAreChangedOverTheJSONAPI()
 
         /// <summary>
