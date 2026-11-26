@@ -132,11 +132,6 @@ namespace cloud.charging.open.DNSServer
         /// </summary>
         public const                String    HTTPRoot          = "cloud.charging.open.DNSServer.HTTPRoot.";
 
-        /// <summary>
-        /// What the log and the SSH page call DNS over SSH.
-        /// </summary>
-        public const                String    DNSOverSSHLabel   = "DNS";
-
         private Int64 requestsReceived;
         private Int64 responsesSent;
 
