@@ -148,6 +148,18 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+        #region Events
+
+        /// <summary>
+        /// The records and zones were changed and written: the zones before and
+        /// after - where a serial went on, the secondaries of that zone are to
+        /// be told. Called within the lock of the records: whoever is told does
+        /// what takes time elsewhere.
+        /// </summary>
+        public event Action<IReadOnlyList<Zone>, IReadOnlyList<Zone>>? OnCommitted;
+
+        #endregion
+
         #region Constructor(s)
 
         /// <summary>
@@ -778,6 +790,139 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+        #region TransferOf(Name)
+
+        /// <summary>
+        /// What a zone transfer of the zone of the given name carries (RFC 5936
+        /// §2.2): the zone, and its records between its SOA and its SOA again -
+        /// or null where the name server is not authoritative for a zone of
+        /// that name.
+        /// </summary>
+        /// <remarks>
+        /// The records of the zone are those whose name is in it and in no zone
+        /// within it. A zone within it is delegated: its NS records are the
+        /// zone's as well, and so are the addresses of its name servers that
+        /// are in it - the glue a secondary of the zone alone needs to find them
+        /// (RFC 1034 §4.2.1).
+        /// </remarks>
+        public (Zone Zone, IReadOnlyList<IDNSResourceRecord> Records)? TransferOf(String Name)
+        {
+
+            var apex = Normalized(Name);
+
+            lock (gate)
+            {
+
+                if (zones.FirstOrDefault(zone => zone.Apex == apex) is not Zone zone)
+                    return null;
+
+                Zone? OwnerOf(String NormalizedName)
+
+                    => zones.Where          (other => other.Contains(NormalizedName)).
+                             OrderByDescending(other => other.Apex.Length).
+                             FirstOrDefault();
+
+                // The zones directly within it: in it, and in no other zone within it.
+                var delegated  = zones.Where(other => other != zone &&
+                                                      zone.Contains(other.Apex) &&
+                                                      OwnerOf(ParentOf(other.Apex)) == zone).
+                                       ToArray();
+
+                var soa        = zone.SOA(DefaultTTL);
+                var transfer   = new List<IDNSResourceRecord> { soa };
+
+                transfer.AddRange(zone.NS(DefaultTTL));
+                transfer.AddRange(records.Where(record => OwnerOf(Normalized(record.DomainName.FullName)) == zone));
+
+                foreach (var child in delegated)
+                {
+
+                    transfer.AddRange(child.NS(DefaultTTL));
+
+                    foreach (var nameServer in child.NameServers.Select(nameServer => Normalized(nameServer.FullName)).
+                                                                 Where (nameServer => child.Contains(nameServer)))
+                        transfer.AddRange(records.Where(record => record.Type is DNSResourceRecordTypes.A or DNSResourceRecordTypes.AAAA &&
+                                                                  Normalized(record.DomainName.FullName) == nameServer));
+
+                }
+
+                transfer.Add(soa);
+
+                return (zone, transfer);
+
+            }
+
+        }
+
+        /// <summary>
+        /// The name one label above the given one - "example.org" for
+        /// "lab.example.org" - or "" for a name of one label.
+        /// </summary>
+        private static String ParentOf(String NormalizedName)
+        {
+
+            var dot = NormalizedName.IndexOf('.');
+
+            return dot < 0
+                       ? ""
+                       : NormalizedName[(dot + 1)..];
+
+        }
+
+        #endregion
+
+        #region TrySetTransfer(Name, Transfer, TransferKeys, Notify, out Changed, out Error, out NotSaved)
+
+        /// <summary>
+        /// To whom the zone of the given name may be transferred, by which TSIG
+        /// keys, and whom it tells of a new serial: what is given is the whole
+        /// of it from now on, what is null stays as it is. Its serial stays as
+        /// well: what it holds did not change.
+        /// </summary>
+        public Boolean TrySetTransfer(String                                 Name,
+                                      IReadOnlyList<System.Net.IPNetwork>?   Transfer,
+                                      IReadOnlyList<DomainName>?             TransferKeys,
+                                      IReadOnlyList<System.Net.IPEndPoint>?  Notify,
+                                      out Zone?                              Changed,
+                                      [NotNullWhen(false)] out String?       Error,
+                                      out Boolean                            NotSaved)
+        {
+
+            Changed   = null;
+            NotSaved  = false;
+
+            var apex  = Normalized(Name);
+
+            lock (gate)
+            {
+
+                if (zones.FirstOrDefault(zone => zone.Apex == apex) is not Zone zone)
+                {
+                    Error = $"The name server is not authoritative for {Name}.";
+                    return false;
+                }
+
+                var changed = zone with {
+                                  Transfer      = Transfer     ?? zone.Transfer,
+                                  TransferKeys  = TransferKeys ?? zone.TransferKeys,
+                                  Notify        = Notify       ?? zone.Notify
+                              };
+
+                if (!TryCommit(records, [ .. zones.Select(other => other == zone ? changed : other) ], out Error))
+                {
+                    NotSaved = true;
+                    return false;
+                }
+
+                Changed = changed;
+                return true;
+
+            }
+
+        }
+
+        #endregion
+
         #region MadeByTheZones()
 
         /// <summary>
@@ -923,6 +1068,8 @@ namespace cloud.charging.open.DNSServer
             var updatedRecords  = Records.ToArray();
             var updatedZones    = Zones.  ToArray();
 
+            var before          = zones.ToArray();
+
             records.Clear();
             records.AddRange(updatedRecords);
 
@@ -930,6 +1077,8 @@ namespace cloud.charging.open.DNSServer
             zones.AddRange(updatedZones);
 
             Rebuild();
+
+            OnCommitted?.Invoke(before, updatedZones);
 
             return true;
 

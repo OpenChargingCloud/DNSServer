@@ -46,7 +46,10 @@ namespace cloud.charging.open.DNSServer
     ///     "refresh":      86400,
     ///     "retry":        7200,
     ///     "expire":       1209600,
-    ///     "minimum":      3600
+    ///     "minimum":      3600,
+    ///     "transfer":     [ "192.0.2.53", "2001:db8:53::/48" ],
+    ///     "transferKeys": [ "ns2-transfer." ],
+    ///     "notify":       [ "192.0.2.53", "[2001:db8:53::1]:5353" ]
     /// } ]
     /// </code>
     /// <para>
@@ -59,6 +62,14 @@ namespace cloud.charging.open.DNSServer
     /// The serial is the date and a number of the day, YYYYMMDDnn (RFC 1912
     /// §2.2), counted on by every change of a record in the zone, and written
     /// with it: a resolver or a secondary sees a change by a greater serial.
+    /// </para>
+    /// <para>
+    /// "transfer" are the addresses and prefixes the zone may be transferred
+    /// to (AXFR, RFC 5936; IXFR, RFC 1995) - its secondaries - and
+    /// "transferKeys" the TSIG keys of the "tsigKeys" of the section a request
+    /// for it may be signed with instead (RFC 8945). Without either, the zone
+    /// is transferred to nobody. "notify" are the secondaries told of each new
+    /// serial (RFC 1996): an address, with a port where not 53.
     /// </para>
     /// </remarks>
     public sealed record Zone
@@ -132,6 +143,21 @@ namespace cloud.charging.open.DNSServer
         /// The negative TTL: how long a resolver keeps a "not there".
         /// </summary>
         public TimeSpan                             Minimum        { get; init; } = DefaultMinimum;
+
+        /// <summary>
+        /// The addresses and prefixes the zone may be transferred to: "192.0.2.53", "2001:db8::/32".
+        /// </summary>
+        public IReadOnlyList<System.Net.IPNetwork>  Transfer       { get; init; } = [];
+
+        /// <summary>
+        /// The TSIG keys a request to transfer the zone may be signed with instead.
+        /// </summary>
+        public IReadOnlyList<DomainName>            TransferKeys   { get; init; } = [];
+
+        /// <summary>
+        /// The secondaries told of each new serial (RFC 1996).
+        /// </summary>
+        public IReadOnlyList<System.Net.IPEndPoint> Notify         { get; init; } = [];
 
         /// <summary>
         /// The name of the zone as two names are compared.
@@ -208,6 +234,114 @@ namespace cloud.charging.open.DNSServer
 
             => NormalizedName == NormalizedApex ||
                NormalizedName.EndsWith("." + NormalizedApex, StringComparison.Ordinal);
+
+        #endregion
+
+        #region MayTransferTo(Address, TSIGKeyName)
+
+        /// <summary>
+        /// Whether the zone may be transferred to a request from the given
+        /// address, signed with the given TSIG key or with none.
+        /// </summary>
+        public Boolean MayTransferTo(System.Net.IPAddress  Address,
+                                     DomainName?           TSIGKeyName)
+        {
+
+            if (TSIGKeyName is not null &&
+                TransferKeys.Any(key => ResourceRecords.Normalized(key.FullName) == ResourceRecords.Normalized(TSIGKeyName.FullName)))
+                return true;
+
+            // An IPv4 client on a socket of both families is ::ffff:a.b.c.d.
+            var address = Address.IsIPv4MappedToIPv6
+                              ? Address.MapToIPv4()
+                              : Address;
+
+            return Transfer.Any(network => network.Contains(address));
+
+        }
+
+        #endregion
+
+        #region (static) TryParseTransfer(Text, out Network) / TryParseNotify(Text, out EndPoint)
+
+        /// <summary>
+        /// An address - every one of its prefix length - or a prefix a zone may
+        /// be transferred to: "192.0.2.53", "192.0.2.0/24", "2001:db8::/32".
+        /// </summary>
+        public static Boolean TryParseTransfer(String                       Text,
+                                               out System.Net.IPNetwork    Network)
+        {
+
+            var text = Text.Trim();
+
+            if (!text.Contains('/') &&
+                System.Net.IPAddress.TryParse(text, out var address) &&
+                (text.Contains(':') || text.Count(c => c == '.') == 3))
+            {
+                Network = new System.Net.IPNetwork(address, address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 32 : 128);
+                return true;
+            }
+
+            if (text.Contains('/') &&
+                System.Net.IPNetwork.TryParse(text, out Network))
+                return true;
+
+            Network = default;
+            return false;
+
+        }
+
+        /// <summary>
+        /// A secondary to tell of a new serial: an address, and a port where not
+        /// 53 - "192.0.2.53", "192.0.2.53:5353", "[2001:db8::53]:5353".
+        /// </summary>
+        public static Boolean TryParseNotify(String                                         Text,
+                                             [NotNullWhen(true)] out System.Net.IPEndPoint? EndPoint)
+        {
+
+            EndPoint = null;
+
+            var text = Text.Trim();
+
+            // An IPv6 address without a port has colons, and is no endpoint. One
+            // in brackets is given with its port: .NET would read it and drop it.
+            if (!text.StartsWith('[') &&
+                System.Net.IPAddress.TryParse(text, out var address) &&
+                (text.Contains(':') || text.Count(c => c == '.') == 3))
+            {
+                EndPoint = new System.Net.IPEndPoint(address, 53);
+                return true;
+            }
+
+            if (!System.Net.IPEndPoint.TryParse(text, out var endPoint) ||
+                endPoint.Port == 0 ||
+                !(text.StartsWith('[') || text.Count(c => c == '.') == 3))
+                return false;
+
+            EndPoint = endPoint;
+            return true;
+
+        }
+
+        /// <summary>
+        /// A secondary to tell of a new serial, as the zone writes it: its
+        /// address, and its port where not 53.
+        /// </summary>
+        public static String TextOf(System.Net.IPEndPoint EndPoint)
+
+            => EndPoint.Port == 53
+                   ? EndPoint.Address.ToString()
+                   : EndPoint.ToString();
+
+        /// <summary>
+        /// An address or prefix the zone may be transferred to, as the zone
+        /// writes it: an address alone where it is one.
+        /// </summary>
+        public static String TextOf(System.Net.IPNetwork Network)
+
+            => Network.PrefixLength == (Network.BaseAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 32 : 128)
+                   ? Network.BaseAddress.ToString()
+                   : Network.ToString();
 
         #endregion
 
@@ -365,7 +499,67 @@ namespace cloud.charging.open.DNSServer
 
             #endregion
 
+            #region transfer, transferKeys, notify
+
+            if (!TryParseList(json, "transfer", where, "address or prefix it may be transferred to", text => TryParseTransfer(text, out var network) ? network : (System.Net.IPNetwork?) null, out var transfer, out Error) ||
+                !TryParseList(json, "notify",   where, "address to tell of a new serial, with a port where not 53", text => TryParseNotify(text, out var endPoint) ? endPoint : null, out var notify, out Error) ||
+                !TryParseList(json, "transferKeys", where, "name of a TSIG key", text => ResourceRecords.TryParseName(text, out var key, out _) ? key : null, out var transferKeys, out Error))
+                return false;
+
+            zone = zone with {
+                       Transfer      = [ .. transfer.Select(network => network!.Value) ],
+                       Notify        = [ .. notify!       ],
+                       TransferKeys  = [ .. transferKeys! ]
+                   };
+
+            #endregion
+
             Zone = zone;
+            return true;
+
+        }
+
+        #endregion
+
+        #region (private static) TryParseList(JSON, Key, Where, What, Parse, out List, out Error)
+
+        /// <summary>
+        /// A list of texts of the zone, each read as what it is.
+        /// </summary>
+        private static Boolean TryParseList<T>(JObject                           JSON,
+                                               String                            Key,
+                                               String                            Where,
+                                               String                            What,
+                                               Func<String, T?>                  Parse,
+                                               out List<T>                       List,
+                                               [NotNullWhen(false)] out String?  Error)
+        {
+
+            List   = [];
+            Error  = null;
+
+            if (JSON[Key] is not JToken token || token.Type == JTokenType.Null)
+                return true;
+
+            if (token is not JArray array)
+            {
+                Error = $"{Where}: \"{Key}\" is no list.";
+                return false;
+            }
+
+            foreach (var entry in array)
+            {
+
+                if (entry.Type != JTokenType.String || Parse(entry.Value<String>()!) is not T value)
+                {
+                    Error = $"{Where}: '{entry}' of its \"{Key}\" is no {What}.";
+                    return false;
+                }
+
+                List.Add(value);
+
+            }
+
             return true;
 
         }
@@ -407,14 +601,17 @@ namespace cloud.charging.open.DNSServer
         public JObject ToJSON()
 
             => new (
-                   new JProperty("name",         Name.FullName),
-                   new JProperty("nameServers",  new JArray(NameServers.Select(nameServer => nameServer.FullName))),
-                   new JProperty("hostmaster",   Hostmaster.ToString()),
-                   new JProperty("serial",       Serial),
-                   new JProperty("refresh",      (Int64) Refresh.TotalSeconds),
-                   new JProperty("retry",        (Int64) Retry.  TotalSeconds),
-                   new JProperty("expire",       (Int64) Expire. TotalSeconds),
-                   new JProperty("minimum",      (Int64) Minimum.TotalSeconds)
+                   new JProperty("name",          Name.FullName),
+                   new JProperty("nameServers",   new JArray(NameServers.Select(nameServer => nameServer.FullName))),
+                   new JProperty("hostmaster",    Hostmaster.ToString()),
+                   new JProperty("serial",        Serial),
+                   new JProperty("refresh",       (Int64) Refresh.TotalSeconds),
+                   new JProperty("retry",         (Int64) Retry.  TotalSeconds),
+                   new JProperty("expire",        (Int64) Expire. TotalSeconds),
+                   new JProperty("minimum",       (Int64) Minimum.TotalSeconds),
+                   new JProperty("transfer",      new JArray(Transfer.    Select(network  => TextOf(network)))),
+                   new JProperty("transferKeys",  new JArray(TransferKeys.Select(key      => key.FullName))),
+                   new JProperty("notify",        new JArray(Notify.      Select(endPoint => TextOf(endPoint))))
                );
 
         #endregion

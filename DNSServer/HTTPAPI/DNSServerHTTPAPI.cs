@@ -47,6 +47,7 @@ namespace cloud.charging.open.DNSServer
     ///   <item>GET    /api/v1/dnsServer/zones                 - every zone the name server is authoritative for: its name, name servers, hostmaster, serial and timers, the SOA and NS records it makes, and a "note" on what it lacks.</item>
     ///   <item>ADD    /api/v1/dnsServer/zones                 - { "name", "nameServers"? }: the name server is authoritative for the zone from now on - answered with { "said", "note", "zones" }.</item>
     ///   <item>REMOVE /api/v1/dnsServer/zones                 - { "name" }: it no longer is; its records stay - answered with { "said", "zones" }.</item>
+    ///   <item>PUT    /api/v1/dnsServer/zones/transfer        - { "name", "transfer"?, "transferKeys"?, "notify"? }: whom the zone may be transferred to, by which TSIG keys, and whom it tells of a new serial - each list given the whole of it, each left out as it is - answered with { "said", "note", "zones" }.</item>
     ///   <item>GET    /api/v1/dnsServer/ssh                   - DNS over SSH, the DNS clients with their keys, and what each login asked over SSH since the start.</item>
     ///   <item>PUT    /api/v1/dnsServer/ssh                   - { "enabled"?, "clients"?: [ { "name", "keys", "enabled" } ] }: DNS over SSH, and who may ask there - answered as GET.</item>
     /// </list>
@@ -116,6 +117,7 @@ namespace cloud.charging.open.DNSServer
             AddHandler(root + "/zones",              GetZones,      HTTPMethod.GET);
             AddHandler(root + "/zones",              AddZone,       HTTPMethod.ADD);
             AddHandler(root + "/zones",              RemoveZone,    REMOVE);
+            AddHandler(root + "/zones/transfer",     PutTransfer,   HTTPMethod.PUT);
             AddHandler(root + "/ssh",                GetSSH,        HTTPMethod.GET);
             AddHandler(root + "/ssh",                PutSSH,        HTTPMethod.PUT);
 
@@ -350,6 +352,52 @@ namespace cloud.charging.open.DNSServer
             }
 
             return Task.FromResult(JSONResponse(Request, HTTPStatusCode.OK, DNSServer.SSHJSON()));
+
+        }
+
+        #endregion
+
+        #region (private) PutTransfer(Request)
+
+        /// <summary>
+        /// Whom a zone may be transferred to, as the command line's "zones
+        /// transfer", "zones transferKeys" and "zones notify".
+        /// </summary>
+        private Task<HTTPResponse> PutTransfer(HTTPRequest Request)
+        {
+
+            if (!TryAuthorize(Request, Permission.Edit(DNSServerAccess.NameServer), true, out var user, out var refused))
+                return Task.FromResult(refused);
+
+            if (!TryParseJSONObject(Request, out var json, out var badRequest))
+                return Task.FromResult(badRequest);
+
+            if (!TryText(json, "name", true, true, out var name, out var problem))
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, problem));
+
+            var lists = new Dictionary<String, List<String>?>();
+
+            foreach (var key in new[] { "transfer", "transferKeys", "notify" })
+            {
+
+                lists[key] = null;
+
+                if (json[key] is not JToken token || token.Type == JTokenType.Null)
+                    continue;
+
+                if (token is not JArray array || array.Any(entry => entry.Type != JTokenType.String))
+                    return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, $"\"{key}\" is a list of texts."));
+
+                lists[key] = [ .. array.Select(entry => entry.Value<String>()!) ];
+
+            }
+
+            if (lists.Values.All(list => list is null))
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "Nothing to change: \"transfer\", \"transferKeys\" or \"notify\"."));
+
+            return Task.FromResult(Answer(Request,
+                                          DNSServer.SetTransfer(name!, lists["transfer"], lists["transferKeys"], lists["notify"], user.Id.ToString()),
+                                          Zones: true));
 
         }
 

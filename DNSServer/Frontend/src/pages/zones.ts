@@ -1,8 +1,8 @@
-import { api, type ListedZone, type NewZone, type ZonesChanged } from '../api/client';
+import { api, type ListedZone, type NewZone, type Zone, type ZoneTransfers, type ZonesChanged } from '../api/client';
 import { auth } from '../auth';
 import type { Page } from '@node/router';
 import { mayButNot, reloadButton, shell } from '@node/shell';
-import { errorMessage, field, whileSaving } from '@node/ui';
+import { errorMessage, field, formatSince, formatTimestamp, whileSaving } from '@node/ui';
 import { anyFormTypedSinceDrawn, unsaved } from '@node/unsaved';
 import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
 import { toURL } from '@node/basePath';
@@ -18,7 +18,24 @@ import { toURL } from '@node/basePath';
  * answered by their name, as every record in no zone is. The hostmaster and
  * the timers of the SOA are changed in the "zones" of the "dnsServer" section,
  * by hand.
+ *
+ * Its secondaries are set here as well: the addresses and prefixes it may be
+ * transferred to (AXFR, IXFR), the TSIG keys a transfer may be signed with
+ * instead, and the addresses told of each new serial (NOTIFY) - with the last
+ * transfer of each zone, and whether each secondary answered its last NOTIFY.
  */
+/** Whom a zone is transferred to, in words: its addresses and prefixes, and its TSIG keys - or nobody. */
+export function transferWords(Zone: Zone): string {
+
+    const to = [ ...Zone.transfer, ...Zone.transferKeys.map(key => `TSIG key ${key}`) ];
+
+    return to.length > 0
+               ? to.join(', ')
+               : 'nobody';
+
+}
+
+
 export const zonesPage: Page = {
 
     title: 'Zones',
@@ -39,6 +56,9 @@ export const zonesPage: Page = {
         let cancelled = false;
         let current: ListedZone[] | null = null;
 
+        /** The zone the form of the secondaries is of. */
+        let picked: string | null = null;
+
 
         function draw(): void {
 
@@ -57,6 +77,7 @@ export const zonesPage: Page = {
 
                 <div class="cards stacked">
                     ${zonesCard(zones)}
+                    ${zones.length > 0 ? transferCard(zones) : nothing}
                     ${addCard()}
                 </div>
 
@@ -107,9 +128,26 @@ export const zonesPage: Page = {
                         <div class="kv"><span class="k">Hostmaster</span>   <span class="v zone-hostmaster">${Zone.hostmaster}</span></div>
                         <div class="kv"><span class="k">Name servers</span> <span class="v zone-name-servers">${Zone.nameServers.join(', ')}</span></div>
                         <div class="kv"><span class="k">Negative TTL</span> <span class="v">${Zone.minimum} s</span></div>
+                        <div class="kv"><span class="k">Transferred to</span> <span class="v zone-transfer">${transferWords(Zone)}</span></div>
+                        <div class="kv"><span class="k">Notifies</span>       <span class="v zone-notify">${Zone.notify.length > 0 ? Zone.notify.join(', ') : 'nobody'}</span></div>
                     </div>
 
                     ${Zone.note !== null ? html`<p class="form-error zone-note">${Zone.note}</p>` : nothing}
+
+                    ${Zone.lastTransfer !== null ? html`
+                        <p class="hint zone-last-transfer">
+                            ${Zone.lastTransfer.refused === null
+                                  ? `Last ${Zone.lastTransfer.kind} ${formatTimestamp(Zone.lastTransfer.at)} (${formatSince(Zone.lastTransfer.at)}) to ${Zone.lastTransfer.to}: serial ${Zone.lastTransfer.serial}, ${Zone.lastTransfer.records} record${Zone.lastTransfer.records === 1 ? '' : 's'}.`
+                                  : `Last ${Zone.lastTransfer.kind} refused ${formatTimestamp(Zone.lastTransfer.at)} (${formatSince(Zone.lastTransfer.at)}) to ${Zone.lastTransfer.to}: ${Zone.lastTransfer.refused}.`}
+                        </p>
+                    ` : nothing}
+
+                    ${Zone.notified.map(notified => html`
+                        <p class="hint zone-notified" data-notified="${notified.to}">
+                            NOTIFY of serial ${notified.serial} to ${notified.to} ${formatTimestamp(notified.at)}:
+                            ${notified.answered ? 'answered' : `not answered after ${notified.tries} tries`}.
+                        </p>
+                    `)}
 
                     <div class="table-scroll">
                         <table class="records dns-records">
@@ -131,6 +169,87 @@ export const zonesPage: Page = {
 
                 </div>
             `;
+
+        }
+
+
+        /** The form of the secondaries of a zone: whom it is transferred to, by which keys, and whom it tells. */
+        function transferCard(Zones: ListedZone[]): TemplateResult {
+
+            const zone = Zones.find(candidate => candidate.name === picked) ?? Zones[0]!;
+
+            return html`
+                <section class="card" id="zone-transfer-card">
+
+                    <h2><i class="fa-solid fa-right-left"></i> Secondaries</h2>
+
+                    <form id="zone-transfer" class="form-stack" @submit=${onTransfer}>
+
+                        <label>Zone
+                            <select name="zone" ?disabled=${!mayChange}
+                                    @change=${(event: Event) => { picked = (event.target as HTMLSelectElement).value; draw(); }}>
+                                ${Zones.map(candidate => html`<option value="${candidate.name}" ?selected=${candidate.name === zone.name}>${candidate.name}</option>`)}
+                            </select>
+                        </label>
+
+                        <label>Transferred to
+                            <input type="text" name="transfer" autocomplete="off" spellcheck="false" ?disabled=${!mayChange}
+                                   placeholder="192.0.2.53 2001:db8:53::/48" .value=${zone.transfer.join(' ')} />
+                            <span class="hint">
+                                The addresses and prefixes of its secondaries, separated by spaces or commas: they may
+                                ask for the whole zone (AXFR, IXFR), over TCP. Empty, nobody may - but by a key below.
+                            </span>
+                        </label>
+
+                        <label>By TSIG keys
+                            <input type="text" name="transferKeys" autocomplete="off" spellcheck="false" ?disabled=${!mayChange}
+                                   placeholder="ns2-transfer" .value=${zone.transferKeys.join(' ')} />
+                            <span class="hint">
+                                A transfer signed with one of these keys (RFC 8945) is made from whatever address. The keys
+                                are written into the "tsigKeys" of the "dnsServer" section by hand, with their secrets.
+                            </span>
+                        </label>
+
+                        <label>Notifies
+                            <input type="text" name="notify" autocomplete="off" spellcheck="false" ?disabled=${!mayChange}
+                                   placeholder="192.0.2.53 [2001:db8:53::1]:5353" .value=${zone.notify.join(' ')} />
+                            <span class="hint">
+                                The secondaries told of each new serial (NOTIFY), so that they ask now rather than at
+                                their next refresh: an address, with a port where not 53.
+                            </span>
+                        </label>
+
+                        <div class="form-actions">
+                            <button type="submit" class="btn primary" ?disabled=${!mayChange}>Save the secondaries</button>
+                            <span id="zone-transfer-note"  class="form-notice" role="status"></span>
+                            <span id="zone-transfer-error" class="form-error"  role="alert"></span>
+                        </div>
+
+                    </form>
+
+                </section>
+            `;
+
+        }
+
+
+        function onTransfer(event: SubmitEvent): void {
+
+            event.preventDefault();
+
+            const form   = event.currentTarget as HTMLFormElement;
+            const words  = (name: string) => field(form, name).split(/[\s,]+/).filter(word => word.length > 0);
+
+            const transfers: ZoneTransfers = {
+                name:          field(form, 'zone'),
+                transfer:      words('transfer'),
+                transferKeys:  words('transferKeys'),
+                notify:        words('notify')
+            };
+
+            picked = transfers.name;
+
+            void change(() => api.dnsServer.setTransfer(transfers), '#zone-transfer');
 
         }
 
@@ -211,7 +330,7 @@ export const zonesPage: Page = {
          * the list.
          */
         async function change(Send:  () => Promise<ZonesChanged>,
-                              From:  '#add-zone' | '#zones',
+                              From:  '#add-zone' | '#zones' | '#zone-transfer',
                               Form:  HTMLFormElement | null = null): Promise<void> {
 
             const note   = content.querySelector<HTMLElement>(`${From}-note`);

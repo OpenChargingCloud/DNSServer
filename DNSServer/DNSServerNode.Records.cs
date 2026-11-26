@@ -310,6 +310,116 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+        #region SetTransfer(Name, Transfer, TransferKeys, Notify, By)
+
+        /// <summary>
+        /// To whom the zone of the given name may be transferred, by which TSIG
+        /// keys, and whom it tells of a new serial - as the command line's
+        /// "zones transfer", "zones transferKeys" and "zones notify" and the JSON
+        /// API's PUT v1/dnsServer/zones/transfer say it. What is given is the
+        /// whole of it from now on, an empty list nobody; what is null stays.
+        /// </summary>
+        /// <param name="Name">The name of the zone; a trailing dot is optional.</param>
+        /// <param name="Transfer">Addresses and prefixes: "192.0.2.53", "2001:db8::/32".</param>
+        /// <param name="TransferKeys">Names of TSIG keys of the "tsigKeys" of the section.</param>
+        /// <param name="Notify">Addresses, with a port where not 53: "192.0.2.53", "[2001:db8::53]:5353".</param>
+        /// <param name="By">Who changed it, for the log.</param>
+        public RecordsChange SetTransfer(String                Name,
+                                         IEnumerable<String>?  Transfer,
+                                         IEnumerable<String>?  TransferKeys,
+                                         IEnumerable<String>?  Notify,
+                                         String                By)
+        {
+
+            if (!TryParseZoneName(Name, out var zoneName, out var error))
+                return new (error, null, RecordsChangeOutcome.Refused);
+
+            List<System.Net.IPNetwork>?   transfer      = null;
+            List<DomainName>?             transferKeys  = null;
+            List<System.Net.IPEndPoint>?  notify        = null;
+
+            if (Transfer is not null)
+            {
+
+                transfer = [];
+
+                foreach (var text in Transfer.Where(text => !String.IsNullOrWhiteSpace(text)))
+                {
+
+                    if (!Zone.TryParseTransfer(text, out var network))
+                        return new ($"'{text.Trim()}' is no address or prefix to transfer a zone to: \"192.0.2.53\", \"192.0.2.0/24\", \"2001:db8::/32\".", null, RecordsChangeOutcome.Refused);
+
+                    if (!transfer.Contains(network))
+                        transfer.Add(network);
+
+                }
+
+            }
+
+            if (TransferKeys is not null)
+            {
+
+                transferKeys = [];
+
+                foreach (var text in TransferKeys.Where(text => !String.IsNullOrWhiteSpace(text)))
+                {
+
+                    if (!ResourceRecords.TryParseName(text, out var keyName, out _) ||
+                        !Settings.TSIGKeys.Any(key => ResourceRecords.Normalized(key.Name.FullName) == ResourceRecords.Normalized(keyName.FullName)))
+                        return new ($"'{text.Trim()}' is no TSIG key of this name server: " +
+                                    (Settings.TSIGKeys.Count == 0
+                                         ? $"it has none - they are written into the \"tsigKeys\" of the \"{DNSServerSettings.SectionName}\" section by hand, and are known from the next start on."
+                                         : $"it has {String.Join(", ", Settings.TSIGKeys.Select(key => key.Name.FullName))}."),
+                                    null,
+                                    RecordsChangeOutcome.Refused);
+
+                    if (!transferKeys.Any(known => ResourceRecords.Normalized(known.FullName) == ResourceRecords.Normalized(keyName.FullName)))
+                        transferKeys.Add(keyName);
+
+                }
+
+            }
+
+            if (Notify is not null)
+            {
+
+                notify = [];
+
+                foreach (var text in Notify.Where(text => !String.IsNullOrWhiteSpace(text)))
+                {
+
+                    if (!Zone.TryParseNotify(text, out var endPoint))
+                        return new ($"'{text.Trim()}' is no address to tell of a new serial: \"192.0.2.53\", \"192.0.2.53:5353\", \"[2001:db8::53]:5353\".", null, RecordsChangeOutcome.Refused);
+
+                    if (!notify.Contains(endPoint))
+                        notify.Add(endPoint);
+
+                }
+
+            }
+
+            if (!Records.TrySetTransfer(zoneName.FullName, transfer, transferKeys, notify, out var changed, out error, out var notSaved))
+                return new (error, null, notSaved ? RecordsChangeOutcome.NotSaved : RecordsChangeOutcome.NothingMatched);
+
+            var said = $"The zone {changed!.Name.FullName} is transferred to {TransferText(changed)}" +
+                       (changed.Notify.Count > 0
+                            ? $", and tells {String.Join(", ", changed.Notify.Select(Zone.TextOf))} of each new serial."
+                            : ", and tells nobody of a new serial.");
+
+            Log.Notice($"{said} ({By})", "dnsserver", "zones", "transfer");
+
+            // Where a zone is transferred to nobody, but tells somebody of a new
+            // serial, that somebody is told of what it may not ask for.
+            var note = changed.Notify.Count > 0 && changed.Transfer.Count == 0 && changed.TransferKeys.Count == 0
+                           ? "It tells secondaries of a new serial that it transfers to nobody: they are refused when they ask for it."
+                           : null;
+
+            return new (said, note, RecordsChangeOutcome.Changed);
+
+        }
+
+        #endregion
+
         #region WithoutAddressNote(Zone)
 
         /// <summary>
@@ -610,8 +720,15 @@ namespace cloud.charging.open.DNSServer
 
                         var json = zone.ToJSON();
 
-                        json.Add(new JProperty("records",  new JArray(Records.MadeBy(zone).Select(RecordJSON))));
-                        json.Add(new JProperty("note",     WithoutAddressNote(zone)));
+                        json.Add(new JProperty("records",       new JArray(Records.MadeBy(zone).Select(RecordJSON))));
+                        json.Add(new JProperty("note",          WithoutAddressNote(zone)));
+                        json.Add(new JProperty("lastTransfer",  Transfers.LastTransfers.TryGetValue(zone.Apex, out var transfer)
+                                                                    ? transfer.ToJSON()
+                                                                    : null));
+                        json.Add(new JProperty("notified",      new JArray(Notifier.LastNotifies.
+                                                                               Where  (notified => notified.Key.StartsWith(zone.Apex + " ", StringComparison.Ordinal)).
+                                                                               OrderBy(notified => notified.Key, StringComparer.Ordinal).
+                                                                               Select (notified => notified.Value.ToJSON()))));
 
                         return json;
 

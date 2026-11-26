@@ -169,6 +169,16 @@ namespace cloud.charging.open.DNSServer
         public HermodDNSServer    Server       { get; }
 
         /// <summary>
+        /// The zone transfers - AXFR and IXFR - to the secondaries of the zones.
+        /// </summary>
+        public ZoneTransfers      Transfers    { get; }
+
+        /// <summary>
+        /// What tells the secondaries of a zone of its new serial (NOTIFY).
+        /// </summary>
+        public ZoneNotifier       Notifier     { get; }
+
+        /// <summary>
         /// The machines that may ask over SSH.
         /// </summary>
         public DNSClientSSHSignIns  SSHClients  { get; }
@@ -324,14 +334,28 @@ namespace cloud.charging.open.DNSServer
 
             #region The name server
 
+            // Zone transfers first, every other question to the zones and records.
+            this.Transfers  = new ZoneTransfers(Records, new AuthoritativeDNSRequestHandler(Records));
+            this.Transfers.OnNotice += (level, message) => this.Log.Log(level, message, "dnsserver", "transfer");
+
+            this.Notifier   = new ZoneNotifier(Settings.DefaultTTL);
+            this.Notifier.OnNotice  += (level, message) => this.Log.Log(level, message, "dnsserver", "notify");
+
+            this.Records.OnCommitted += (before, after) => {
+                if (IsServing)
+                    Notifier.Changed(before, after);
+            };
+
             this.Server = new HermodDNSServer(
-                              new AuthoritativeDNSRequestHandler(Records),
+                              Transfers,
                               new DNSServerOptions {
                                   EnableUDPUnicast    = Settings.UDP,
                                   EnableTCPUnicast    = Settings.TCP,
                                   EnableUDPMulticast  = false,
                                   UDPUnicastSocket    = new IPSocket(Settings.Listen, Settings.Port),
-                                  TCPUnicastSocket    = new IPSocket(Settings.Listen, Settings.Port)
+                                  TCPUnicastSocket    = new IPSocket(Settings.Listen, Settings.Port),
+                                  // Requests signed with them are verified, and their answers signed (RFC 8945).
+                                  TSIGKeys            = Settings.TSIGKeys
                               }
                           );
 
@@ -631,6 +655,14 @@ namespace cloud.charging.open.DNSServer
                             : "."),
                        "dnsserver");
 
+            foreach (var zone in Records.Zones.Where(zone => zone.Transfer.Count > 0 || zone.TransferKeys.Count > 0 || zone.Notify.Count > 0))
+                Log.Info($"The zone {zone.Name.FullName} is transferred to {TransferText(zone)}" +
+                         (zone.Notify.Count > 0 ? $", and tells {String.Join(", ", zone.Notify.Select(Zone.TextOf))} of each new serial." : "."),
+                         "dnsserver", "transfer");
+
+            // RFC 1996 §3.10: a zone may have changed while the server did not run.
+            Notifier.All(Records.Zones);
+
             if (Settings.SSHEnabled)
             {
                 if (SSHEnabled)
@@ -665,6 +697,8 @@ namespace cloud.charging.open.DNSServer
         protected override async Task OnStopping()
         {
 
+            Notifier.Stop();
+
             await Server.Stop();
 
             await base.OnStopping();
@@ -694,6 +728,20 @@ namespace cloud.charging.open.DNSServer
             return String.Join(" and ", listeners);
 
         }
+
+        #endregion
+
+        #region (static) TransferText(Zone)
+
+        /// <summary>
+        /// To whom a zone is transferred, in words: its addresses and prefixes,
+        /// and its TSIG keys - or nobody.
+        /// </summary>
+        public static String TransferText(Zone Zone)
+
+            => Zone.Transfer.Count == 0 && Zone.TransferKeys.Count == 0
+                   ? "nobody"
+                   : String.Join(", ", [ .. Zone.Transfer.Select(Zone.TextOf), .. Zone.TransferKeys.Select(key => $"TSIG key {key.FullName}") ]);
 
         #endregion
 

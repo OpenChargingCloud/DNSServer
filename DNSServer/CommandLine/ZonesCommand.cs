@@ -38,6 +38,9 @@ namespace cloud.charging.open.DNSServer.CommandLine
     /// zones &lt;zone&gt;                               one of them
     /// zones add &lt;zone&gt; [&lt;nameServer&gt; ...]       the name server is authoritative for it from now on
     /// zones remove &lt;zone&gt;                        it is no longer - its records stay
+    /// zones transfer &lt;zone&gt; &lt;address|prefix&gt; ...  whom it may be transferred to (AXFR, IXFR) - none: to nobody
+    /// zones transferKeys &lt;zone&gt; &lt;key&gt; ...        by which TSIG keys as well - none: by none
+    /// zones notify &lt;zone&gt; &lt;address[:port]&gt; ...   whom it tells of each new serial (NOTIFY) - none: nobody
     /// </code>
     /// The name servers are those its NS records name, the first the primary of
     /// its SOA; without one, "ns." and the zone. The hostmaster is
@@ -60,6 +63,11 @@ namespace cloud.charging.open.DNSServer.CommandLine
         private static readonly String[] Add     = [ "add" ];
         private static readonly String[] Remove  = [ "remove", "delete" ];
 
+        /// <summary>
+        /// What is set of a zone's transfers, and how it is typed.
+        /// </summary>
+        private static readonly String[] Transfers = [ "transfer", "transferKeys", "notify" ];
+
         #endregion
 
         #region Suggest(Arguments)
@@ -73,12 +81,12 @@ namespace cloud.charging.open.DNSServer.CommandLine
                            : [];
 
             if (Arguments.Length == 2)
-                return new[] { "add", "remove" }.
+                return ((String[]) [ "add", "remove", .. Transfers ]).
                            Where (sub => sub.StartsWith(Arguments[1], StringComparison.OrdinalIgnoreCase)).
                            Select(sub => SuggestionResponse.ParameterCompleted($"{CommandName} {sub}"));
 
-            // The zones there are, for the one to take away.
-            if (Arguments.Length == 3 && Is(Arguments[1], Remove))
+            // The zones there are, for the one to take away or change.
+            if (Arguments.Length == 3 && (Is(Arguments[1], Remove) || Is(Arguments[1], Transfers)))
                 return cli.DNSServer.Records.Zones.
                            Select(zone => zone.Name.FullName).
                            Where (name => name.StartsWith(Arguments[2], StringComparison.OrdinalIgnoreCase)).
@@ -100,7 +108,9 @@ namespace cloud.charging.open.DNSServer.CommandLine
                        ? Added  (Arguments)
                        : Arguments.Length >= 2 && Is(Arguments[1], Remove)
                              ? Removed(Arguments)
-                             : Listed (Arguments)
+                             : Arguments.Length >= 2 && Is(Arguments[1], Transfers)
+                                   ? TransferSet(Arguments)
+                                   : Listed (Arguments)
                );
 
         #endregion
@@ -140,6 +150,21 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
                 if (cli.DNSServer.WithoutAddressNote(zone) is String note)
                     lines.Add($"        {note}");
+
+                lines.Add($"        transferred to {DNSServerNode.TransferText(zone)}" +
+                          (zone.Notify.Count > 0 ? $", tells {String.Join(", ", zone.Notify.Select(Zone.TextOf))} of a new serial" : ""));
+
+                if (cli.DNSServer.Transfers.LastTransfers.TryGetValue(zone.Apex, out var last))
+                    lines.Add(last.Refused is null
+                                  ? $"        last {last.Kind} {last.At.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC to {last.To}, serial {last.Serial}"
+                                  : $"        last {last.Kind} refused {last.At.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC to {last.To}: {last.Refused}");
+
+                foreach (var notified in cli.DNSServer.Notifier.LastNotifies.
+                                             Where  (entry => entry.Key.StartsWith(zone.Apex + " ", StringComparison.Ordinal)).
+                                             OrderBy(entry => entry.Key, StringComparer.Ordinal).
+                                             Select (entry => entry.Value))
+                    lines.Add($"        NOTIFY of serial {notified.Serial} to {notified.To} {notified.At.UtcDateTime:yyyy-MM-dd HH:mm:ss} UTC: " +
+                              (notified.Answered ? "answered" : $"not answered after {notified.Tries} tries"));
 
             }
 
@@ -190,6 +215,45 @@ namespace cloud.charging.open.DNSServer.CommandLine
         #endregion
 
 
+        #region (private) TransferSet(Arguments)
+
+        /// <summary>
+        /// zones transfer|transferKeys|notify &lt;zone&gt; &lt;value&gt; ... - or "none".
+        /// </summary>
+        private String[] TransferSet(String[] Arguments)
+        {
+
+            var what = Transfers.First(word => word.Equals(Arguments[1], StringComparison.OrdinalIgnoreCase));
+
+            if (Arguments.Length < 4)
+                return [ what switch {
+                             "transfer"      => $"{CommandName} transfer <zone> <address|prefix> ... | none - e.g. '{CommandName} transfer example.org 192.0.2.53 2001:db8:53::/48'",
+                             "transferKeys"  => $"{CommandName} transferKeys <zone> <key> ... | none - e.g. '{CommandName} transferKeys example.org ns2-transfer'",
+                             _               => $"{CommandName} notify <zone> <address[:port]> ... | none - e.g. '{CommandName} notify example.org 192.0.2.53 [2001:db8:53::1]:5353'"
+                         } ];
+
+            if (!cli.MayDo(Permission.Edit(DNSServerAccess.NameServer), CommandName, out var refused))
+                return [ refused ];
+
+            String[] values = Arguments.Length == 4 && Arguments[3].Equals("none", StringComparison.OrdinalIgnoreCase)
+                                  ? []
+                                  : Arguments[3..];
+
+            var change = cli.DNSServer.SetTransfer(Arguments[2],
+                                                   what == "transfer"     ? values : null,
+                                                   what == "transferKeys" ? values : null,
+                                                   what == "notify"       ? values : null,
+                                                   cli.Caller.ToString());
+
+            return change.Note is not null
+                       ? [ change.Said, change.Note ]
+                       : [ change.Said ];
+
+        }
+
+        #endregion
+
+
         #region (private static) Is(Text, Words)
 
         private static Boolean Is(String Text, String[] Words)
@@ -202,8 +266,9 @@ namespace cloud.charging.open.DNSServer.CommandLine
 
         public override String Help()
 
-            => $"{CommandName} [<zone> | add <zone> [<nameServer> ...] | remove <zone>] - the zones the name server is authoritative for, " +
-                "with the SOA and NS records it makes: listed, added, removed";
+            => $"{CommandName} [<zone> | add <zone> [<nameServer> ...] | remove <zone> | transfer|transferKeys|notify <zone> <value> ... | none] - " +
+                "the zones the name server is authoritative for, with the SOA and NS records it makes: listed, added, removed - and whom each is " +
+                "transferred to, by address or TSIG key, and whom it tells of a new serial";
 
         #endregion
 

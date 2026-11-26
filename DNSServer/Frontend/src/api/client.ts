@@ -204,13 +204,51 @@ export interface Zone {
     expire:       number;
     /** The negative TTL: how long a resolver keeps a "not there". */
     minimum:      number;
+    /** The addresses and prefixes it may be transferred to (AXFR, IXFR): "192.0.2.53", "2001:db8::/32". */
+    transfer:      string[];
+    /** The TSIG keys a request to transfer it may be signed with instead. */
+    transferKeys:  string[];
+    /** The secondaries told of each new serial (NOTIFY): "192.0.2.53", "[2001:db8::53]:5353". */
+    notify:        string[];
+}
+
+/** The last transfer of a zone, or the last refused. */
+export interface ZoneTransfer {
+    at:       string;
+    /** Who asked: its address, and its TSIG key where it signed with one. */
+    to:       string;
+    kind:     'AXFR' | 'IXFR';
+    serial:   number;
+    /** How many records it carried; 1 where the secondary was up to date. */
+    records:  number;
+    /** Why it was not transferred - or null where it was. */
+    refused:  string | null;
+}
+
+/** The last NOTIFY of a zone to one secondary. */
+export interface ZoneNotify {
+    at:        string;
+    to:        string;
+    serial:    number;
+    answered:  boolean;
+    tries:     number;
 }
 
 /** A zone as GET /dnsServer/zones lists it: with the SOA and NS records it makes, and what it lacks to be found. */
 export interface ListedZone extends Zone {
-    records:  ResourceRecord[];
+    records:       ResourceRecord[];
     /** Which of its name servers are in it and have no address yet - or null. */
-    note:     string | null;
+    note:          string | null;
+    lastTransfer:  ZoneTransfer | null;
+    notified:      ZoneNotify[];
+}
+
+/** Whom a zone is transferred to: PUT /dnsServer/zones/transfer - each list the whole of it, each left out as it is. */
+export interface ZoneTransfers {
+    name:           string;
+    transfer?:      string[];
+    transferKeys?:  string[];
+    notify?:        string[];
 }
 
 /** A new zone: ADD /dnsServer/zones - { name, nameServers? }; without name servers, "ns." and the zone. */
@@ -311,6 +349,7 @@ export const api = {
         zones:       ()                     => request<ListedZone[]>       ('GET',    '/dnsServer/zones'),
         addZone:     (zone: NewZone)        => request<ZonesChanged>       ('ADD',    '/dnsServer/zones', zone),
         removeZone:  (name: string)         => request<ZonesChanged>       ('REMOVE', '/dnsServer/zones', { name }),
+        setTransfer: (transfers: ZoneTransfers) => request<ZonesChanged>   ('PUT',    '/dnsServer/zones/transfer', transfers),
         ssh:         ()                     => request<DNSOverSSH>         ('GET',    '/dnsServer/ssh'),
         setSSH:      (change: SSHChange)    => request<DNSOverSSH>         ('PUT',    '/dnsServer/ssh', change)
     }

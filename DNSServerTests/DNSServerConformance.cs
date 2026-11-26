@@ -483,6 +483,68 @@ namespace cloud.charging.open.DNSServer.Tests
 
         #endregion
 
+        #region TheTransfersOfAZoneAreSetOverTheJSONAPI()
+
+        /// <summary>
+        /// Whom a zone is transferred to and whom it tells of a new serial, set
+        /// with PUT - each list the whole of it, each left out as it is - and
+        /// what is no address, a zone that is none and nothing to set refused.
+        /// </summary>
+        [Test]
+        public async Task TheTransfersOfAZoneAreSetOverTheJSONAPI()
+        {
+
+            using var http          = await SignedIn();
+
+            await Send(http, ADD, "api/v1/dnsServer/zones", new JObject(new JProperty("name", "example.org")));
+
+            var (set, answer)       = await Send(http, HttpMethod.Put, "api/v1/dnsServer/zones/transfer",
+                                                 new JObject(new JProperty("name",      "example.org"),
+                                                             new JProperty("transfer",  new JArray("192.0.2.53", "2001:db8:53::/48")),
+                                                             new JProperty("notify",    new JArray("192.0.2.53"))));
+
+            Assert.That(set,                                           Is.EqualTo(HttpStatusCode.OK), answer.ToString());
+            Assert.That(answer["said"]!.Value<String>(),               Does.StartWith("The zone example.org. is transferred to 192.0.2.53, 2001:db8:53::/48"));
+
+            var zone                = answer["zones"]![0]!;
+
+            Assert.Multiple(() => {
+                Assert.That(zone["transfer"]!.Values<String>(),        Is.EqualTo(new[] { "192.0.2.53", "2001:db8:53::/48" }));
+                Assert.That(zone["notify"]!.Values<String>(),          Is.EqualTo(new[] { "192.0.2.53" }));
+                Assert.That(zone["transferKeys"]!.Values<String>(),    Is.Empty);
+                Assert.That(zone["lastTransfer"]!.Type,                Is.EqualTo(JTokenType.Null));
+            });
+
+            var (kept, keptAnswer)  = await Send(http, HttpMethod.Put, "api/v1/dnsServer/zones/transfer",
+                                                 new JObject(new JProperty("name",      "example.org."),
+                                                             new JProperty("notify",    new JArray())));
+
+            Assert.That(kept,                                          Is.EqualTo(HttpStatusCode.OK), keptAnswer.ToString());
+            Assert.That(keptAnswer["zones"]![0]!["transfer"]!.Count(), Is.EqualTo(2), "what was left out stays");
+            Assert.That(keptAnswer["zones"]![0]!["notify"]!.Count(),   Is.Zero);
+
+            var (badAddress, why)   = await Send(http, HttpMethod.Put, "api/v1/dnsServer/zones/transfer",
+                                                 new JObject(new JProperty("name",      "example.org"),
+                                                             new JProperty("transfer",  new JArray("secondary.example.org"))));
+
+            var (noZone, notOne)    = await Send(http, HttpMethod.Put, "api/v1/dnsServer/zones/transfer",
+                                                 new JObject(new JProperty("name",      "example.com"),
+                                                             new JProperty("transfer",  new JArray("192.0.2.53"))));
+
+            var (nothing, said)     = await Send(http, HttpMethod.Put, "api/v1/dnsServer/zones/transfer",
+                                                 new JObject(new JProperty("name",      "example.org")));
+
+            Assert.Multiple(() => {
+                Assert.That(badAddress,                                Is.EqualTo(HttpStatusCode.BadRequest), why.ToString());
+                Assert.That(why.ToString(),                            Does.Contain("is no address or prefix"));
+                Assert.That(noZone,                                    Is.EqualTo(HttpStatusCode.NotFound),   notOne.ToString());
+                Assert.That(nothing,                                   Is.EqualTo(HttpStatusCode.BadRequest), said.ToString());
+            });
+
+        }
+
+        #endregion
+
         #region AnOperatorMayReadTheRecordsButNotChangeThem()
 
         [Test]

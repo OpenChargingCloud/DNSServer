@@ -3,11 +3,12 @@
  * server that keeps what it is sent: a zone added with the name servers typed
  * - or without, for "ns." and the zone - listed with the SOA and NS records it
  * makes and what it lacks to be found, removed after asking, what the server
- * refused said beside the form, and for whoever may only look, nothing that
- * changes anything.
+ * refused said beside the form, its secondaries set - the form filled with the
+ * zone picked - its last transfer and NOTIFY shown, and for whoever may only
+ * look, nothing that changes anything.
  */
 
-import { asked, field, open, refused, said, submit, type, until, type Asked } from '../../test/dnsServer.ts';
+import { asked, change, field, open, refused, said, submit, type, until, type Asked } from '../../test/dnsServer.ts';
 
 import { strict as assert }  from 'node:assert';
 import { describe, it }      from 'node:test';
@@ -15,7 +16,15 @@ import { describe, it }      from 'node:test';
 const { zonesPage } = await import('./zones.ts');
 
 
-interface Kept { name: string; nameServers: string[] }
+interface Kept {
+    name:           string;
+    nameServers:    string[];
+    transfer?:      string[];
+    transferKeys?:  string[];
+    notify?:        string[];
+    lastTransfer?:  unknown;
+    notified?:      unknown[];
+}
 
 let zones: Kept[] = [];
 
@@ -38,12 +47,30 @@ function asZone(Zone: Kept): Record<string, unknown> {
         minimum:      3600,
         records:      [ { name: Zone.name, type: 'SOA', class: 'IN', ttl: 3600, data: soa, value: null, line: `${Zone.name} 3600 IN SOA ${soa}` },
                         ...Zone.nameServers.map(nameServer => ({ name: Zone.name, type: 'NS', class: 'IN', ttl: 3600, data: nameServer, value: null, line: `${Zone.name} 3600 IN NS ${nameServer}` })) ],
-        note:         Zone.nameServers[0]!.endsWith(Zone.name) ? `${Zone.nameServers[0]} has no address yet.` : null
+        note:         Zone.nameServers[0]!.endsWith(Zone.name) ? `${Zone.nameServers[0]} has no address yet.` : null,
+        transfer:      Zone.transfer     ?? [],
+        transferKeys:  Zone.transferKeys ?? [],
+        notify:        Zone.notify       ?? [],
+        lastTransfer:  Zone.lastTransfer ?? null,
+        notified:      Zone.notified     ?? []
     };
 
 }
 
 function dnsServer({ method, path, body }: Asked): unknown {
+
+    if (method === 'PUT' && path === '/dnsServer/zones/transfer') {
+
+        const sent = body as { name: string; transfer?: string[]; transferKeys?: string[]; notify?: string[] };
+
+        if (sent.transfer?.some(entry => !/^[\d.:/a-f[\]]+$/.test(entry)))
+            return refused(400, `'${sent.transfer.find(entry => !/^[\d.:/a-f[\]]+$/.test(entry))}' is no address or prefix to transfer a zone to.`);
+
+        zones = zones.map(zone => zone.name === sent.name ? { ...zone, transfer: sent.transfer, transferKeys: sent.transferKeys, notify: sent.notify } : zone);
+
+        return { said: `The zone ${sent.name} is transferred to ${sent.transfer?.join(', ')}.`, note: null, zones: zones.map(asZone) };
+
+    }
 
     if (path !== '/dnsServer/zones')
         return undefined;
@@ -167,6 +194,77 @@ describe('the zones', () => {
 
     });
 
+    it('sets the secondaries of the zone picked - the form filled with what it has - as whole lists', async () => {
+
+        zones = [ { name: 'example.org.', nameServers: [ 'ns.example.org.' ], transfer: [ '192.0.2.53' ] },
+                  { name: 'example.net.', nameServers: [ 'ns.example.org.' ], transfer: [ '198.51.100.53' ], notify: [ '198.51.100.53' ] } ];
+
+        const root = await open(zonesPage, '/dnsServer/zones', mayEdit,
+                                dnsServer, root => root.querySelector('#zone-transfer') !== null);
+
+        assert.equal(field(root, '#zone-transfer', 'transfer').value, '192.0.2.53', 'the first zone is not the one filled in');
+
+        change(field<HTMLSelectElement>(root, '#zone-transfer', 'zone'), 'example.net.');
+
+        await until(() => field(root, '#zone-transfer', 'notify').value === '198.51.100.53', 'the form was not filled with the zone picked');
+
+        assert.equal(field(root, '#zone-transfer', 'transfer').value, '198.51.100.53');
+
+        type(field(root, '#zone-transfer', 'transfer'),     '198.51.100.53, 2001:db8:53::/48');
+        type(field(root, '#zone-transfer', 'transferKeys'), 'ns2-transfer');
+        type(field(root, '#zone-transfer', 'notify'),       '');
+        submit(root, '#zone-transfer');
+
+        await until(() => /Saved, and in effect/.test(root.querySelector('#zone-transfer-note')!.textContent!), 'the secondaries were not saved');
+
+        assert.deepEqual(sent(), [ { method: 'PUT', path: '/dnsServer/zones/transfer',
+                                     body: { name: 'example.net.', transfer: [ '198.51.100.53', '2001:db8:53::/48' ], transferKeys: [ 'ns2-transfer' ], notify: [] } } ]);
+
+        assert.equal(root.querySelector('[data-zone="example.net."] .zone-transfer')!.textContent, '198.51.100.53, 2001:db8:53::/48, TSIG key ns2-transfer');
+        assert.equal(root.querySelector('[data-zone="example.net."] .zone-notify')!.textContent,   'nobody');
+        assert.equal(field<HTMLSelectElement>(root, '#zone-transfer', 'zone').value, 'example.net.', 'the zone picked was not kept');
+
+    });
+
+    it('says what the server refused of the secondaries', async () => {
+
+        zones = [ { name: 'example.org.', nameServers: [ 'ns.example.org.' ] } ];
+
+        const root = await open(zonesPage, '/dnsServer/zones', mayEdit,
+                                dnsServer, root => root.querySelector('#zone-transfer') !== null);
+
+        type(field(root, '#zone-transfer', 'transfer'), 'secondary.example.org');
+        submit(root, '#zone-transfer');
+
+        await until(() => root.querySelector('#zone-transfer-error')!.textContent !== '', 'the refusal was not said');
+
+        assert.match(root.querySelector('#zone-transfer-error')!.textContent!, /no address or prefix/);
+
+    });
+
+    it('shows the last transfer of a zone, and whether its secondaries answered its NOTIFY', async () => {
+
+        zones = [ { name: 'example.org.', nameServers: [ 'ns.example.org.' ], transfer: [ '192.0.2.53' ], notify: [ '192.0.2.53', '192.0.2.54' ],
+                    lastTransfer: { at: '2026-11-26T09:00:00Z', to: '192.0.2.53', kind: 'AXFR', serial: 2026112601, records: 8, refused: null },
+                    notified: [ { at: '2026-11-26T08:59:00Z', to: '192.0.2.53', serial: 2026112601, answered: true,  tries: 1 },
+                                { at: '2026-11-26T08:59:00Z', to: '192.0.2.54', serial: 2026112601, answered: false, tries: 4 } ] },
+                  { name: 'example.net.', nameServers: [ 'ns.example.net.' ],
+                    lastTransfer: { at: '2026-11-26T09:01:00Z', to: '203.0.113.9', kind: 'AXFR', serial: 2026112600, records: 0, refused: 'the zone is transferred to nobody' } } ];
+
+        const root = await open(zonesPage, '/dnsServer/zones', [ 'nameserver:read' ],
+                                dnsServer, root => root.querySelectorAll('[data-zone]').length === 2);
+
+        const org = root.querySelector('[data-zone="example.org."]')!;
+        const net = root.querySelector('[data-zone="example.net."]')!;
+
+        assert.match(org.querySelector('.zone-last-transfer')!.textContent!.replace(/\s+/g, ' '), /Last AXFR .* to 192\.0\.2\.53: serial 2026112601, 8 records\./);
+        assert.match(org.querySelector('[data-notified="192.0.2.53"]')!.textContent!.replace(/\s+/g, ' '), /: answered\./);
+        assert.match(org.querySelector('[data-notified="192.0.2.54"]')!.textContent!.replace(/\s+/g, ' '), /not answered after 4 tries/);
+        assert.match(net.querySelector('.zone-last-transfer')!.textContent!.replace(/\s+/g, ' '), /Last AXFR refused .* to 203\.0\.113\.9: the zone is transferred to nobody\./);
+        assert.equal(net.querySelector('.zone-transfer')!.textContent, 'nobody');
+
+    });
+
     it('changes nothing for whoever may only look, and says why', async () => {
 
         zones = [ { name: 'example.org.', nameServers: [ 'ns.example.org.' ] } ];
@@ -176,7 +274,7 @@ describe('the zones', () => {
 
         assert.match(root.querySelector('.notice')!.textContent!, /may look at the zones but not change them/);
 
-        for (const control of root.querySelectorAll<HTMLButtonElement>('button[data-remove-zone], #add-zone button[type="submit"]'))
+        for (const control of root.querySelectorAll<HTMLButtonElement>('button[data-remove-zone], #add-zone button[type="submit"], #zone-transfer button[type="submit"], #zone-transfer input'))
             assert.equal(control.disabled, true, `${control.outerHTML} can be used`);
 
     });

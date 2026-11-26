@@ -23,6 +23,7 @@ using System.Diagnostics.CodeAnalysis;
 using Newtonsoft.Json.Linq;
 
 using org.GraphDefined.Vanaheimr.Hermod;
+using org.GraphDefined.Vanaheimr.Hermod.DNS;
 
 #endregion
 
@@ -68,7 +69,8 @@ namespace cloud.charging.open.DNSServer
     ///     "records":     [ "www.example.org. 3600 IN A 192.0.2.10" ],
     ///     "zones":       [ { "name": "example.org." } ],
     ///     "ssh":         { "enabled": true,
-    ///                      "clients": [ { "name": "cs001", "keys": [ "ssh-ed25519 AAAA... cs001" ] } ] }
+    ///                      "clients": [ { "name": "cs001", "keys": [ "ssh-ed25519 AAAA... cs001" ] } ] },
+    ///     "tsigKeys":    [ { "name": "ns2-transfer.", "algorithm": "hmac-sha256", "secret": "base64..." } ]
     /// }
     /// </code>
     /// Every key may be left out, and then reads as its default. The records
@@ -79,7 +81,10 @@ namespace cloud.charging.open.DNSServer
     /// NS records it makes for them (see <see cref="Zone"/>). "ssh" says
     /// whether DNS is answered over SSH as well, as the subsystem
     /// "dns@open.charging.cloud" of the node's SSH server, and which machines
-    /// besides the accounts may ask there.
+    /// besides the accounts may ask there. "tsigKeys" are the keys requests may
+    /// be signed with (RFC 8945) - a zone transfer by one of the "transferKeys"
+    /// of a zone among them - and are written by hand: their secrets are in
+    /// this file and nowhere else, never in an answer of the JSON API.
     /// </remarks>
     public sealed record DNSServerSettings
     {
@@ -150,6 +155,23 @@ namespace cloud.charging.open.DNSServer
         /// The machines that may ask over SSH.
         /// </summary>
         public IReadOnlyList<DNSClientEntry>  SSHClients    { get; init; } = [];
+
+        /// <summary>
+        /// The TSIG keys requests may be signed with (RFC 8945).
+        /// </summary>
+        public IReadOnlyList<TSIGKey>         TSIGKeys      { get; init; } = [];
+
+        /// <summary>
+        /// The algorithms of a TSIG key, by the names the section writes them
+        /// with: those of RFC 8945 §6 that Hermod signs with.
+        /// </summary>
+        public static readonly IReadOnlyDictionary<String, DomainName> TSIGAlgorithmNames = new Dictionary<String, DomainName>(StringComparer.OrdinalIgnoreCase) {
+            [ "hmac-sha256" ]  = TSIGAlgorithms.HMACSHA256,
+            [ "hmac-sha384" ]  = TSIGAlgorithms.HMACSHA384,
+            [ "hmac-sha512" ]  = TSIGAlgorithms.HMACSHA512,
+            [ "hmac-sha224" ]  = TSIGAlgorithms.HMACSHA224,
+            [ "hmac-sha1"   ]  = TSIGAlgorithms.HMACSHA1
+        };
 
         #endregion
 
@@ -365,6 +387,51 @@ namespace cloud.charging.open.DNSServer
 
             #endregion
 
+            #region tsigKeys
+
+            if (json["tsigKeys"] is JToken keysToken && keysToken.Type != JTokenType.Null)
+            {
+
+                if (keysToken is not JArray keysArray)
+                {
+                    Error = $"\"tsigKeys\" of the \"{SectionName}\" section is a list of {{ \"name\", \"algorithm\", \"secret\" }}.";
+                    return false;
+                }
+
+                var keys = new List<TSIGKey>();
+
+                foreach (var keyToken in keysArray)
+                {
+
+                    if (!TryParseTSIGKey(keyToken, out var key, out Error))
+                        return false;
+
+                    if (keys.Any(known => ResourceRecords.Normalized(known.Name.FullName) == ResourceRecords.Normalized(key.Name.FullName)))
+                    {
+                        Error = $"The TSIG key {key.Name.FullName} is listed twice in \"tsigKeys\" of the \"{SectionName}\" section.";
+                        return false;
+                    }
+
+                    keys.Add(key);
+
+                }
+
+                settings = settings with { TSIGKeys = keys };
+
+            }
+
+            // A zone transferred by a key there is not would be transferred by
+            // nobody that way, and say nothing of why.
+            foreach (var zone in settings.Zones)
+                foreach (var transferKey in zone.TransferKeys)
+                    if (!settings.TSIGKeys.Any(key => ResourceRecords.Normalized(key.Name.FullName) == ResourceRecords.Normalized(transferKey.FullName)))
+                    {
+                        Error = $"The zone {zone.Name.FullName} is transferred by the TSIG key {transferKey.FullName}, which is not among the \"tsigKeys\" of the \"{SectionName}\" section.";
+                        return false;
+                    }
+
+            #endregion
+
             if (!settings.UDP && !settings.TCP)
             {
                 Error = $"The \"{SectionName}\" section switches off both UDP and TCP: DNS would be answered nowhere.";
@@ -492,6 +559,64 @@ namespace cloud.charging.open.DNSServer
 
         #endregion
 
+        #region (static) TryParseTSIGKey(JSON, out Key, out Error)
+
+        /// <summary>
+        /// One TSIG key: { "name": "ns2-transfer.", "algorithm": "hmac-sha256", "secret": "base64..." } -
+        /// the algorithm hmac-sha256 where none is given, the secret as tsig-keygen and dnssec-keygen
+        /// write it.
+        /// </summary>
+        public static Boolean TryParseTSIGKey(JToken?                                   JSON,
+                                              [NotNullWhen(true)]  out TSIGKey?         Key,
+                                              [NotNullWhen(false)] out String?          Error)
+        {
+
+            Key = null;
+
+            if (JSON is not JObject json ||
+                json["name"]?.Type != JTokenType.String ||
+                !ResourceRecords.TryParseName(json.Value<String>("name")!, out var name, out _))
+            {
+                Error = $"An entry of \"tsigKeys\" of the \"{SectionName}\" section is no {{ \"name\", \"algorithm\", \"secret\" }} with a name: '{JSON?.ToString(Newtonsoft.Json.Formatting.None)}'.";
+                return false;
+            }
+
+            var algorithmText = json["algorithm"]?.Type == JTokenType.String
+                                    ? json.Value<String>("algorithm")!.Trim().TrimEnd('.')
+                                    : "hmac-sha256";
+
+            if (!TSIGAlgorithmNames.TryGetValue(algorithmText, out var algorithm))
+            {
+                Error = $"The TSIG key {name.FullName} has the algorithm '{algorithmText}', which is none of {String.Join(", ", TSIGAlgorithmNames.Keys)}.";
+                return false;
+            }
+
+            Byte[] secret;
+
+            try
+            {
+                secret = Convert.FromBase64String(json["secret"]?.Type == JTokenType.String ? json.Value<String>("secret")!.Trim() : "");
+            }
+            catch (FormatException)
+            {
+                secret = [];
+            }
+
+            // RFC 8945 §6.2: a key shorter than the output of its hash is weaker than it.
+            if (secret.Length < 16)
+            {
+                Error = $"The TSIG key {name.FullName} has no \"secret\", in Base64, of at least 16 octets - 'tsig-keygen {name.FullName.TrimEnd('.')}' makes one.";
+                return false;
+            }
+
+            Key   = new TSIGKey(name, secret, algorithm);
+            Error = null;
+            return true;
+
+        }
+
+        #endregion
+
         #region (static) TryParseListen(Text, out Address)
 
         /// <summary>
@@ -591,7 +716,12 @@ namespace cloud.charging.open.DNSServer
                    new JProperty("defaultTTL",  (Int64) DefaultTTL.TotalSeconds),
                    new JProperty("records",     new JArray(Records)),
                    new JProperty("zones",       new JArray(Zones.Select(zone => zone.ToJSON()))),
-                   new JProperty("ssh",         SSHToJSON())
+                   new JProperty("ssh",         SSHToJSON()),
+                   // The secrets stay in the file: what is said of a key is its name and algorithm.
+                   new JProperty("tsigKeys",    new JArray(TSIGKeys.Select(key => new JObject(
+                                                    new JProperty("name",       key.Name.FullName),
+                                                    new JProperty("algorithm",  key.Algorithm.FullName.TrimEnd('.'))
+                                                ))))
                );
 
         /// <summary>
